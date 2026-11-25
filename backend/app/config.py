@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # Comma-separated exact browser origins are supported, for example:
     # https://smterminal-web.vercel.app,https://smterminal.example.com
-    frontend_origin: str = "http://localhost:3000"
+    frontend_origin: str = "http://localhost:3000,https://smterminal-web.vercel.app"
     environment: str = "development"
 
     # Server-to-server protection for hosted deployments.
@@ -69,3 +69,28 @@ def parse_frontend_origins(raw: str | None) -> list[str]:
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def get_frontend_origins(settings: Settings) -> list[str]:
+    """Return the exact browser origins allowed by this deployment.
+
+    Development may use localhost. Production is restricted to explicitly
+    configured HTTPS origins; HTTP and localhost origins are filtered out.
+    The default list includes the current Vercel production domain so a fresh
+    backend deployment does not silently default to localhost only.
+    """
+    origins = parse_frontend_origins(settings.frontend_origin)
+    # This project's production Vercel domain is an exact trusted origin. Keep
+    # it present even when an older backend environment still explicitly sets
+    # FRONTEND_ORIGIN to localhost only; deployments can add custom domains.
+    production_origin = "https://smterminal-web.vercel.app"
+    if production_origin not in origins:
+        origins.append(production_origin)
+    if settings.environment.lower() == "production":
+        origins = [
+            origin for origin in origins
+            if origin.startswith("https://")
+            and "localhost" not in origin
+            and "127.0.0.1" not in origin
+        ]
+    return origins

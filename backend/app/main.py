@@ -9,7 +9,7 @@ import httpx
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from app.config import get_settings, parse_frontend_origins
+from app.config import get_settings, get_frontend_origins
 from app.rate_limit import limiter
 from app.routers import instruments, market, orders, trading_mode, watchlists
 from app.security import RequestContextMiddleware, SecurityHeadersMiddleware, logger
@@ -18,7 +18,7 @@ from app.services.watch_registry import registry
 from app.ws.gateway import router as ws_router
 
 settings = get_settings()
-frontend_origins = parse_frontend_origins(settings.frontend_origin)
+frontend_origins = get_frontend_origins(settings)
 if settings.environment.lower() == "production":
     def is_strong_secret(value: str | None) -> bool:
         return bool(
@@ -34,11 +34,10 @@ if settings.environment.lower() == "production":
             ("TERMINAL_WS_SECRET", settings.terminal_ws_secret),
         ) if not is_strong_secret(value)
     ]
-    # FRONTEND_ORIGIN isn't a secret, but left at its local-dev default it
-    # fails every WebSocket upgrade in production (the gateway's origin
-    # check never matches), silently and with no server-side signal until
-    # now - so it gets the same fail-fast treatment as the secrets above.
-    if not frontend_origins or any(origin.startswith("http://") or "localhost" in origin for origin in frontend_origins):
+    # Production accepts only exact HTTPS browser origins. Localhost entries
+    # are filtered by get_frontend_origins(), so they can never be admitted by
+    # accident when a production process starts.
+    if not frontend_origins:
         missing_security.append("FRONTEND_ORIGIN (set exact production HTTPS origin(s), comma-separated)")
     if missing_security:
         raise RuntimeError(

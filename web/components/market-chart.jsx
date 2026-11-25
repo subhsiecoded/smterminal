@@ -198,10 +198,10 @@ function drawChart(canvas, rows, options) {
       const row = rows[index];
       if (!row || typeof row !== "object") continue;
       const x = xFor(index);
-      const open = asNumber(row.open, asNumber(row.close));
-      const close = asNumber(row.close);
-      const high = asNumber(row.high, Math.max(open, close));
-      const low = asNumber(row.low, Math.min(open, close));
+      const open = asNumber(row?.open, asNumber(row?.close));
+      const close = asNumber(row?.close);
+      const high = asNumber(row?.high, Math.max(open, close));
+      const low = asNumber(row?.low, Math.min(open, close));
       const color = close >= open ? GREEN : RED;
       const yOpen = yFor(open);
       const yClose = yFor(close);
@@ -256,7 +256,7 @@ function drawChart(canvas, rows, options) {
       const x = xFor(index);
       const volume = Math.max(0, asNumber(row.volume));
       const barHeight = (volume / maxVolume) * Math.max(8, volumeBottom - volumeTop - 13);
-      ctx.fillStyle = asNumber(row.close) >= asNumber(row.open) ? "rgba(0,255,65,.42)" : "rgba(255,65,65,.42)";
+      ctx.fillStyle = asNumber(row?.close) >= asNumber(row?.open) ? "rgba(0,255,65,.42)" : "rgba(255,65,65,.42)";
       ctx.fillRect(x - bodyWidth / 2, volumeBottom - barHeight, bodyWidth, barHeight);
     }
   }
@@ -422,7 +422,7 @@ export default function MarketChart({ candles = [], symbol, interval, loading = 
 
   const handleWheel = useCallback((event) => {
     if (!validCandles.length) return;
-    event.preventDefault();
+    if (event.cancelable) event.preventDefault();
     const rect = stageRef.current?.getBoundingClientRect();
     if (!rect) return;
     const deltaY = event.deltaY;

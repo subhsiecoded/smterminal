@@ -10,14 +10,11 @@ from app.services import finnhub_client, indicators, market_data, yahoo_client
 from app.services.india_screener import ScreenerUnavailable, screen_india
 from app.services.cache import get_cached_quote, get_staleness, publish_quote
 from app.services.memory_store import store
+from app.services.candle_history import get_candle_snapshot
 from app.services.watch_registry import registry
 from app.services.symbols import normalize_symbol
 
 router = APIRouter(prefix="/api/market", tags=["market"])
-
-# Public, no auth - market data is a shared global feed now, not tied to
-# anyone's personal broker account. Rate limiting is what keeps it from
-# being abused instead.
 
 
 @router.get("/quote/{symbol}", response_model=Quote)
@@ -110,25 +107,14 @@ async def get_candles(
     symbol = normalize_symbol(symbol)
     if symbol is None:
         raise HTTPException(status_code=422, detail="Invalid ticker symbol (command labels are not market symbols)")
-    cache_key = f"candles:{symbol}:{interval}"
-    cached = store.get(cache_key)
-    if cached:
-        return [Candle(**row) for row in json.loads(cached)]
-
-    symbol = normalize_symbol(symbol)
-    if symbol is None:
-        raise HTTPException(status_code=422, detail="Invalid ticker symbol (command labels are not market symbols)")
     try:
-        candles = await yahoo_client.get_candles(symbol, interval)
-    except (httpx.HTTPError, httpx.TimeoutException) as exc:
+        candles = await get_candle_snapshot(symbol, interval)
+    except (httpx.HTTPError, httpx.TimeoutException, ValueError) as exc:
         raise HTTPException(
-            status_code=503, detail="Market data provider unreachable - try again shortly"
+            status_code=503, detail="Market data provider temporarily unavailable; retry later"
         ) from exc
     if not candles:
         raise HTTPException(status_code=404, detail=f"No candle data found for '{symbol}'")
-
-    settings = get_settings()
-    store.set(cache_key, json.dumps(candles), settings.candle_cache_ttl_seconds)
     return [Candle(**row) for row in candles]
 
 
@@ -227,10 +213,10 @@ async def get_indicators(
     if symbol is None:
         raise HTTPException(status_code=422, detail="Invalid ticker symbol (command labels are not market symbols)")
     try:
-        candles = await yahoo_client.get_candles(symbol, interval)
-    except (httpx.HTTPError, httpx.TimeoutException) as exc:
+        candles = await get_candle_snapshot(symbol, interval)
+    except (httpx.HTTPError, httpx.TimeoutException, ValueError) as exc:
         raise HTTPException(
-            status_code=503, detail="Market data provider unreachable - try again shortly"
+            status_code=503, detail="Market data provider temporarily unavailable; retry later"
         ) from exc
     if not candles:
         raise HTTPException(status_code=404, detail=f"No candle data found for '{symbol}'")

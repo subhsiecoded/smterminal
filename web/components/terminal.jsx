@@ -5,21 +5,9 @@ const DEFAULT_SYMBOLS = ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "^NS
 const INTERVALS = ["1m", "5m", "15m", "1h", "1d", "1w"];
 const CATEGORIES = ["gainers", "losers", "active", "turnover", "unusual-volume", "all"];
 const RESERVED = new Set(["INDIA-MOVERS", "INDIA", "SCREENER", "NSE", "MOVERS", "GAINERS", "LOSERS", "ACTIVE", "TURNOVER", "UNUSUAL-VOLUME"]);
+const SYMBOL_ALIASES = { NVIDIA: "NVDA", "NVIDIA CORP": "NVDA", "NVIDIA CORPORATION": "NVDA" };
 const SYMBOL_RE = /^[A-Z0-9^][A-Z0-9.^=_-]{0,31}$/;
 const BLOCKS = " ▁▂▃▄▅▆▇█";
-function emitAppNotice(notice) {
-    if (typeof window === "undefined") return;
-    window.dispatchEvent(new CustomEvent("smterminal:notice", {
-        detail: {
-            level: "error",
-            title: "Application error",
-            message: "Something went wrong. Please try again.",
-            source: "APPLICATION",
-            ...notice,
-        },
-    }));
-}
-
 async function api(path, init) {
     const endpoint = `/api/backend/${path.replace(/^\//, "")}`;
     let response;
@@ -31,13 +19,6 @@ async function api(path, init) {
         });
     } catch (error) {
         const message = error instanceof Error ? error.message : "Network request failed";
-        emitAppNotice({
-            title: "Backend connection interrupted",
-            message: "The market-data service could not be reached. The terminal will keep the last available data and retry on the next refresh.",
-            detail: `${endpoint} · ${message}`,
-            source: "API / NETWORK",
-            level: "error",
-        });
         throw new Error(message || "Market-data backend is unreachable");
     }
 
@@ -51,13 +32,6 @@ async function api(path, init) {
         const detail = payload && typeof payload === "object" && "detail" in payload
             ? String(payload.detail)
             : `Request failed (${response.status})`;
-        emitAppNotice({
-            title: response.status >= 500 ? "Backend service error" : "Request could not be completed",
-            message: detail,
-            detail: `${endpoint} · HTTP ${response.status}`,
-            source: "MARKET DATA API",
-            level: response.status >= 500 ? "error" : "warning",
-        });
         throw new Error(detail);
     }
     return payload;
@@ -65,7 +39,8 @@ async function api(path, init) {
 function cleanSymbols(values) {
     const cleaned = [];
     for (const value of values) {
-        const symbol = value.trim().toUpperCase();
+        const raw = value.trim().toUpperCase();
+        const symbol = SYMBOL_ALIASES[raw] || raw;
         if (symbol && !RESERVED.has(symbol) && SYMBOL_RE.test(symbol) && !cleaned.includes(symbol))
             cleaned.push(symbol);
     }
@@ -126,6 +101,35 @@ function parseCommand(raw) {
         return { verb: "select", args: [parts[0].toUpperCase()] };
     return { verb, args: parts.slice(1).map((value) => ["search", "find", "india"].includes(verb) ? value : value.toUpperCase()) };
 }
+function calculateIndicators(candles) {
+    const closes = Array.isArray(candles)
+        ? candles.map((row) => Number(row?.close)).filter(Number.isFinite)
+        : [];
+    if (!closes.length) return {};
+    const average = (values) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+    const ema = (period) => {
+        const multiplier = 2 / (period + 1);
+        let value = closes[0];
+        for (let index = 1; index < closes.length; index += 1) value = closes[index] * multiplier + value * (1 - multiplier);
+        return value;
+    };
+    let rsi14 = null;
+    if (closes.length >= 15) {
+        const changes = closes.slice(-15).slice(1).map((value, index) => value - closes.slice(-15)[index]);
+        const gains = changes.map((value) => Math.max(value, 0));
+        const losses = changes.map((value) => Math.max(-value, 0));
+        const avgGain = average(gains);
+        const avgLoss = average(losses);
+        rsi14 = avgGain === 0 && avgLoss === 0 ? 50 : avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+    }
+    return {
+        sma20: closes.length >= 20 ? average(closes.slice(-20)) : null,
+        ema12: ema(12),
+        ema26: ema(26),
+        rsi14,
+    };
+}
+
 function formatUtcTime(date) {
     return `${date.toISOString().slice(0, 19).replace("T", " ")} UTC`;
 }
@@ -311,25 +315,22 @@ export default function Terminal() {
         const requestId = ++chartRequestId.current;
         setBusy(true);
         try {
-            const [history, technicals] = await Promise.all([
-                api(`market/candles/${encodeURIComponent(selected)}?interval=${interval}`),
-                api(`market/indicators/${encodeURIComponent(selected)}?interval=${interval}`)
-            ]);
+            // Only fetch OHLC once. All four indicators are deterministic
+            // calculations over the same candles and do not need a second Yahoo request.
+            const history = await api(`market/candles/${encodeURIComponent(selected)}?interval=${interval}`);
             if (requestId !== chartRequestId.current) return;
             if (!Array.isArray(history)) throw new Error("The market API returned an invalid candle payload");
-            setCandles(history.filter((row) => row && typeof row === "object"));
-            setIndicators(technicals && typeof technicals === "object" ? technicals : {});
+            const rows = history.filter((row) => row && typeof row === "object");
+            setCandles(rows);
+            setIndicators(calculateIndicators(rows));
             setFeedback(`chart refreshed · ${selected} · ${interval}`);
         }
         catch (error) {
             if (requestId !== chartRequestId.current) return;
-            setCandles([]);
-            setIndicators({});
+            // Keep the last valid chart on intermittent provider failures.
+            // The header status/inline feedback is less disruptive than a toast on every poll.
             const message = error instanceof Error ? error.message : "Unable to load chart";
-            setFeedback(`[chart] ${message}`);
-            if (message.includes("invalid candle payload")) {
-                emitAppNotice({ title: "Chart data format error", message: "The backend returned candle data in an unexpected format. The chart has been isolated and will retry on its next refresh.", detail: message, source: "OHLC DATA VALIDATION", level: "error" });
-            }
+            setFeedback(`[chart] showing last available snapshot · ${message}`);
         }
         finally {
             if (requestId === chartRequestId.current) setBusy(false);
@@ -342,7 +343,7 @@ export default function Terminal() {
     }, [refreshQuotes]);
     useEffect(() => {
         void refreshChart();
-        const id = window.setInterval(() => void refreshChart(), 15000);
+        const id = window.setInterval(() => void refreshChart(), 60000);
         return () => window.clearInterval(id);
     }, [refreshChart]);
     useEffect(() => {
@@ -355,6 +356,7 @@ export default function Terminal() {
         let backoff = 1000;
         let lastHeartbeat = Date.now();
         let ticketInFlight = false;
+        let permanentlyBlocked = false;
 
         const clearHeartbeat = () => {
             if (heartbeatTimer !== null) {
@@ -385,7 +387,7 @@ export default function Terminal() {
         };
 
         const connect = async () => {
-            if (cancelled || manualDisconnect.current || ticketInFlight) return;
+            if (cancelled || manualDisconnect.current || permanentlyBlocked || ticketInFlight) return;
             if (typeof navigator !== "undefined" && !navigator.onLine) {
                 setStatus("offline");
                 return;
@@ -409,16 +411,13 @@ export default function Terminal() {
                     const message = typeof config.detail === "string" ? config.detail : `Live-stream setup failed (${response.status})`;
                     setStatus("error");
                     setFeedback(`[live stream] ${message}`);
-                    emitAppNotice({
-                        title: "Live connection setup failed",
-                        message: response.status >= 500
-                            ? "The terminal cannot establish its live feed right now. It will retry automatically."
-                            : message,
-                        detail: `GET /api/ws-ticket · HTTP ${response.status} · ${message}`,
-                        source: "LIVE STREAM",
-                        level: "error",
-                    });
-                    scheduleReconnect(response.status === 503 ? 20000 : response.status >= 500 || response.status === 429 ? 5000 : 30000);
+                    // 4xx/503 from the ticket route indicate an auth or deployment
+                    // configuration problem. Repeating the same request cannot fix it.
+                    if (response.status < 500 || response.status === 503) {
+                        permanentlyBlocked = true;
+                        return;
+                    }
+                    scheduleReconnect(response.status === 429 ? 30000 : 15000);
                     return;
                 }
 
@@ -426,8 +425,7 @@ export default function Terminal() {
                     setStatus("error");
                     const message = "Backend WSS URL is missing. Configure MARKET_TERMINAL_WS_BASE_URL on the web deployment.";
                     setFeedback(`[live stream] ${message}`);
-                    emitAppNotice({ title: "Live feed is not configured", message, source: "LIVE STREAM CONFIG", detail: "MARKET_TERMINAL_WS_BASE_URL is empty", level: "error" });
-                    scheduleReconnect(30000);
+                    permanentlyBlocked = true;
                     return;
                 }
 
@@ -438,8 +436,7 @@ export default function Terminal() {
                     const message = "The configured backend WebSocket URL is invalid.";
                     setStatus("error");
                     setFeedback(`[live stream] ${message}`);
-                    emitAppNotice({ title: "Invalid live-feed URL", message, source: "LIVE STREAM CONFIG", detail: String(config.wsBaseUrl), level: "error" });
-                    scheduleReconnect(30000);
+                    permanentlyBlocked = true;
                     return;
                 }
                 const securePage = window.location.protocol === "https:";
@@ -447,8 +444,7 @@ export default function Terminal() {
                     const message = "An HTTPS website requires a valid public WSS backend URL.";
                     setStatus("error");
                     setFeedback(`[live stream] ${message}`);
-                    emitAppNotice({ title: "Insecure live-feed configuration", message, source: "LIVE STREAM CONFIG", detail: `Configured protocol: ${baseUrl.protocol}`, level: "error" });
-                    scheduleReconnect(30000);
+                    permanentlyBlocked = true;
                     return;
                 }
 
@@ -505,27 +501,14 @@ export default function Terminal() {
                     if (cancelled || manualDisconnect.current) return;
 
                     if ([1002, 1003, 1007, 1008].includes(event.code)) {
+                        // A policy close is permanent until backend configuration is
+                        // corrected. Stop reconnecting and keep the UI in a quiet
+                        // degraded state instead of generating repeated popups.
+                        permanentlyBlocked = true;
                         setStatus("error");
                         const reason = event.reason || "The backend rejected this WebSocket handshake.";
-                        setFeedback(`[live stream] rejected (${event.code}) ${reason}`);
-                        emitAppNotice({
-                            title: "Live connection rejected by backend",
-                            message: "The live market feed was refused. The terminal will retry slowly while REST market data remains available; verify the backend origin and WebSocket secret configuration.",
-                            detail: `WebSocket close ${event.code} · ${reason}`,
-                            source: "LIVE STREAM / POLICY",
-                            level: "error",
-                        });
-                        scheduleReconnect(30000);
+                        setFeedback(`[live stream disabled] ${reason} · reload after backend configuration is fixed`);
                         return;
-                    }
-                    if (event.code !== 1000 && event.reason) {
-                        emitAppNotice({
-                            title: "Live connection interrupted",
-                            message: "The live feed disconnected. The terminal is reconnecting automatically.",
-                            detail: `WebSocket close ${event.code} · ${event.reason}`,
-                            source: "LIVE STREAM",
-                            level: "warning",
-                        });
                     }
                     scheduleReconnect();
                 };
@@ -542,13 +525,6 @@ export default function Terminal() {
                 setStatus("reconnecting");
                 const message = error instanceof Error ? error.message : "Could not obtain a live connection ticket";
                 setFeedback(`[live stream] ${message}`);
-                emitAppNotice({
-                    title: "Live feed temporarily unavailable",
-                    message: "The terminal could not start its live connection. It will retry with an increasing delay.",
-                    detail: message,
-                    source: "LIVE STREAM",
-                    level: "warning",
-                });
                 scheduleReconnect();
             } finally {
                 ticketInFlight = false;
@@ -965,7 +941,7 @@ export default function Terminal() {
           <div className="indicator-row">
             <span>SMA20 <b>{number(indicators.sma20)}</b></span><span>EMA12 <b>{number(indicators.ema12)}</b></span><span>EMA26 <b>{number(indicators.ema26)}</b></span><span>RSI14 <b>{number(indicators.rsi14)}</b></span>
           </div>
-          <div className="chart-note">INDICATORS COMPUTED SERVER-SIDE · PRICE DATA IS PROVIDER-SUPPLIED · NOT AN EXECUTION FEED</div>
+          <div className="chart-note">INDICATORS COMPUTED FROM PRICE HISTORY · PROVIDER-SUPPLIED DATA · NOT AN EXECUTION FEED</div>
         </section>
 
         <aside className="side-panel" aria-label="Market results">

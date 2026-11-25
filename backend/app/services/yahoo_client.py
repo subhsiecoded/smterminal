@@ -319,12 +319,39 @@ def _parse_candles_payload(data: dict) -> list[dict]:
 
 
 async def get_candles(symbol: str, interval: str) -> list[dict]:
+    """Fetch chart history with a second Yahoo edge as a bounded fallback.
+
+    Yahoo's public chart endpoint occasionally returns 429/5xx from one edge.
+    The alternate host is tried once before the caller falls back to its last
+    cached snapshot or reports the provider as unavailable.
+    """
     yahoo_interval, yahoo_range = _INTERVAL_MAP.get(interval, ("1d", "1y"))
-    async with httpx.AsyncClient(headers=_BASE_HEADERS, timeout=8.0) as client:
-        resp = await client.get(
-            CHART_URL.format(symbol=symbol),
-            params={"interval": yahoo_interval, "range": yahoo_range},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    return _parse_candles_payload(data)
+    last_error: Exception | None = None
+    async with httpx.AsyncClient(headers=_BASE_HEADERS, timeout=10.0, follow_redirects=True) as client:
+        for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+            url = f"https://{host}/v8/finance/chart/{symbol}"
+            try:
+                response = await client.get(
+                    url,
+                    params={"interval": yahoo_interval, "range": yahoo_range},
+                )
+                response.raise_for_status()
+                data = response.json()
+                candles = _parse_candles_payload(data)
+                if candles:
+                    return candles
+                # A valid empty chart response usually means an unsupported
+                # ticker/interval, so do not issue repeated calls to Yahoo.
+                return []
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if exc.response.status_code not in {408, 425, 429, 500, 502, 503, 504}:
+                    raise
+                logger.warning("Yahoo chart edge %s returned HTTP %s for %s", host, exc.response.status_code, symbol)
+            except (httpx.TimeoutException, httpx.RequestError) as exc:
+                last_error = exc
+                logger.warning("Yahoo chart edge %s failed for %s (%s)", host, symbol, type(exc).__name__)
+
+    if last_error is not None:
+        raise last_error
+    return []

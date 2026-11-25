@@ -11,9 +11,18 @@ RESERVED_SYMBOLS = {
 }
 _SYMBOL_RE = re.compile(r"^[A-Z0-9^][A-Z0-9.^=_-]{0,31}$")
 
+# A small explicit alias table for common company-name input. Yahoo Finance
+# expects exchange tickers (NVDA), not display names (NVIDIA).
+SYMBOL_ALIASES = {
+    "NVIDIA": "NVDA",
+    "NVIDIA CORP": "NVDA",
+    "NVIDIA CORPORATION": "NVDA",
+}
+
 
 def normalize_symbol(value: str) -> str | None:
     symbol = str(value or "").strip().upper()
+    symbol = SYMBOL_ALIASES.get(symbol, symbol)
     if not symbol or symbol in RESERVED_SYMBOLS or not _SYMBOL_RE.fullmatch(symbol):
         return None
     return symbol

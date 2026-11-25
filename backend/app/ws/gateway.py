@@ -6,7 +6,7 @@ import time
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from jose import JWTError, jwt
 
-from app.config import get_settings, parse_frontend_origins
+from app.config import get_settings, get_frontend_origins, parse_frontend_origins
 
 from app.services.pubsub import broker
 from app.services.watch_registry import registry
@@ -63,7 +63,7 @@ async def ticks_ws(websocket: WebSocket) -> None:
             # FRONTEND_ORIGIN may list several allowed origins, comma-separated
             # (e.g. a production domain plus Vercel preview URLs) - matched
             # exactly (scheme + host + port), trailing slash ignored.
-            allowed_origins = set(parse_frontend_origins(settings.frontend_origin))
+            allowed_origins = set(get_frontend_origins(settings))
             origin_header = websocket.headers.get("origin", "")
             normalized_origin = parse_frontend_origins(origin_header)
             origin = normalized_origin[0] if normalized_origin else ""
