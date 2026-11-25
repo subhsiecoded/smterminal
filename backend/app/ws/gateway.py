@@ -4,6 +4,9 @@ import logging
 import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
+from jose import JWTError, jwt
+
+from app.config import get_settings
 
 from app.services.pubsub import broker
 from app.services.watch_registry import registry
@@ -21,10 +24,9 @@ _connections_per_ip: dict[str, int] = {}
 
 @router.websocket("/ws/ticks")
 async def ticks_ws(websocket: WebSocket) -> None:
-    """Public live tick stream - no login required. Market data is a shared
-    global feed now (not a personal broker session), so the only protection
-    needed here is anti-abuse, not per-user auth: a per-IP connection cap
-    and a per-connection symbol cap (both generous for a single real user).
+    """Public live tick stream in local development. Hosted deployments can
+    require a short-lived ticket issued by the authenticated Next.js server.
+    Market data is a shared global feed, with per-IP and per-socket caps.
 
     Subscriptions are JSON control messages after connecting -
     {"subscribe": ["AAPL", "TSLA"]} / {"unsubscribe": ["TSLA"]} - so the
@@ -34,6 +36,22 @@ async def ticks_ws(websocket: WebSocket) -> None:
     one asyncio.Queue, subscribed to however many symbol channels it
     wants; publishing a tick just drops it into every subscribed queue.
     """
+    settings = get_settings()
+    if settings.terminal_ws_secret:
+        origin = websocket.headers.get("origin", "").rstrip("/")
+        expected_origin = settings.frontend_origin.rstrip("/")
+        if not origin or origin != expected_origin:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        ticket = websocket.query_params.get("ticket", "")
+        try:
+            payload = jwt.decode(ticket, settings.terminal_ws_secret, algorithms=["HS256"])
+            if payload.get("scope") != "market_ticks":
+                raise JWTError("wrong scope")
+        except JWTError:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
     client_ip = websocket.client.host if websocket.client else "unknown"
     if _connections_per_ip.get(client_ip, 0) >= MAX_CONNECTIONS_PER_IP:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)

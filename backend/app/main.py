@@ -1,4 +1,5 @@
 import asyncio
+import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -17,6 +18,26 @@ from app.services.watch_registry import registry
 from app.ws.gateway import router as ws_router
 
 settings = get_settings()
+if settings.environment.lower() == "production":
+    def is_strong_secret(value: str | None) -> bool:
+        return bool(
+            value
+            and len(value) >= 32
+            and not value.lower().startswith(("replace-with-", "change-this-", "dev-only-"))
+        )
+
+    missing_security = [
+        name for name, value in (
+            ("APP_SECRET_KEY", settings.app_secret_key),
+            ("TERMINAL_BACKEND_TOKEN", settings.terminal_backend_token),
+            ("TERMINAL_WS_SECRET", settings.terminal_ws_secret),
+        ) if not is_strong_secret(value)
+    ]
+    if missing_security:
+        raise RuntimeError(
+            "Production web deployment requires " + ", ".join(missing_security)
+            + ". Configure matching server-side secrets in the backend and Next.js environments."
+        )
 background_tasks: list[asyncio.Task] = []
 
 
@@ -55,6 +76,27 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Market Terminal API", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def protect_hosted_market_api(request: Request, call_next):
+    """When configured, require the private Next.js server-to-server token.
+
+    Local development and the standalone TUI remain unchanged when the token
+    is unset. In a hosted deployment, the browser talks only to Next.js; the
+    Next.js route handler adds this secret header on the server.
+    """
+    protected = (
+        request.url.path.startswith("/api/market/")
+        or request.url.path.startswith("/api/instruments/")
+        or request.url.path == "/api/health/providers"
+    )
+    expected = settings.terminal_backend_token
+    if protected and expected:
+        supplied = request.headers.get("X-Terminal-Server-Token", "")
+        if not secrets.compare_digest(supplied, expected):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 

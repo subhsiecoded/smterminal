@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:3000"
     environment: str = "development"
 
+    # Optional shared-secret gate for a hosted web frontend. Leave unset for
+    # local TUI development; set it in production so only the Next.js server
+    # can call the market-data API directly. Never expose this value to a browser.
+    terminal_backend_token: str | None = None
+    terminal_ws_secret: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:

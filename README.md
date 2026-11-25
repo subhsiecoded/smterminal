@@ -1,14 +1,15 @@
 # Market Terminal
 
-A FastAPI market-data backend plus a real terminal application (not a
-website) - green-phosphor, command-line-driven, live ticks streaming into
-your terminal emulator. Global tickers, no login, no broker account.
+A FastAPI market-data engine with two green-phosphor clients: a keyboard-first
+Python Textual TUI and a Next.js website. Both clients use the same quote,
+candle, indicator, screener and live-tick APIs. Global tickers; no broker
+account is required for market research.
 
 ```
-backend/   FastAPI - the data engine. No external services at all: no Redis, no database required to run it
-tui/       Textual TUI client - the actual interactive surface now (replaces the old Next.js app)
-supabase/  Schema for login/orders/watchlists - intact but dormant, see "Re-enabling login" below
-API_KEYS.md  Every free API key relevant here, what's wired in vs. just an option
+backend/   FastAPI market-data engine; no Redis or database required for market data
+tui/       Python Textual terminal for a local terminal emulator
+web/       Next.js browser terminal (JavaScript/JSX only; no TypeScript)
+api_keys.md  Provider keys: what's wired in, what's optional, and what's not used
 ```
 
 ## This pass: the entire India stock market
@@ -36,12 +37,17 @@ own self-check for the parsing logic specifically, run against NSE's
 documented CSV columns including the stray header whitespace that's
 been observed in the wild.
 
-## This pass: "no website" and "more advanced"
+## Terminal clients: TUI and web
 
-The web frontend is gone - deleted, not just unlinked - replaced with
-`tui/`, a genuine terminal application built on
-[Textual](https://textual.textualize.io/). See `tui/README.md` for
-commands and keybindings. The backend gained real features to back it:
+The Python TUI remains the native terminal-emulator experience. `web/` now
+provides a browser-native companion built with Next.js and plain JavaScript/JSX
+(no TypeScript source or compiler dependency); it recreates the TUI's
+green-phosphor layout, block-character price chart, watchlist, ticker
+tape, side panel, command bar and NSE screener. It calls the same FastAPI
+endpoints rather than reimplementing market-data calculations. See
+`web/README.md` for the web setup and deployment details.
+
+The backend's market features include:
 
 - **Technical indicators**, computed server-side from real candle
   history: SMA(20), EMA(12/26), RSI(14), using Wilder's actual smoothing
@@ -56,7 +62,7 @@ commands and keybindings. The backend gained real features to back it:
 - **Company news**, if you set `FINNHUB_API_KEY` - free, included on
   their free tier, distinguishes "not configured" from "no news found"
   rather than showing an ambiguous empty panel either way.
-- See **`API_KEYS.md`** for the full picture: every free provider
+- See **`api_keys.md`** for the full picture: every free provider
   relevant to this app, what's actually wired in, and what's just a
   credible alternative if you want it.
 
@@ -136,22 +142,94 @@ depend on it.
 
 ## Running it locally
 
-No external services - just two Python environments.
+Clone the repository and open three terminal windows. The backend is shared
+by both clients; you can run the Python TUI, the Next.js website, or both.
+Yahoo Finance and CoinGecko need no API key. `FINNHUB_API_KEY` is optional.
+
+### 1. Start the backend
+
+In terminal 1, from the repository root:
 
 ```bash
-# 1. Backend - works with just one required var
 cd backend
 cp .env.example .env
-python -c "import secrets; print(secrets.token_hex(32))"   # → APP_SECRET_KEY
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-# optional: FINNHUB_API_KEY in .env for real-time US ticks + news - see API_KEYS.md
+python -m pip install -r requirements.txt
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
 
-# 2. TUI - in another terminal
-cd ../tui
-pip install -r requirements.txt
+Copy the generated value into `APP_SECRET_KEY` in `backend/.env`, then run:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+On Windows PowerShell, use `Copy-Item .env.example .env` instead of `cp`.
+
+### 2. Start the Next.js website
+
+In terminal 2, from the repository root:
+
+```bash
+cd web
+cp .env.example .env.local
+```
+
+Edit `web/.env.local`: set `TERMINAL_ACCESS_PASSWORD` to the shared
+website sign-in password and set `TERMINAL_SESSION_SECRET` to an independent
+random value. For example:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
+```
+
+Then start the web app:
+
+```bash
+npm install
+npm run dev
+```
+
+On Windows PowerShell, use `Copy-Item .env.example .env.local` instead of
+`cp`. Open `http://localhost:3000` and sign in with
+`TERMINAL_ACCESS_PASSWORD`.
+
+### 3. (Optional) Start the Python TUI
+
+In terminal 3, from the repository root:
+
+```bash
+cd tui
+python -m pip install -r requirements.txt
 python main.py
 ```
+
+### Docker Compose
+
+After creating `backend/.env` and `web/.env.local` as above, run this from
+the repository root:
+
+```bash
+docker compose up --build
+```
+
+Open `http://localhost:3000`. The WebSocket endpoint is exposed separately
+on `localhost:8000` for the browser's live feed.
+
+## Environment template notes
+
+`backend/.env.example` includes the market-data settings, optional Finnhub
+key, and the optional Supabase/PostgreSQL settings for the dormant auth and
+order features. `SUPABASE_URL` is the HTTPS Supabase project API URL used by
+`supabase-py`; `DATABASE_URL` is the PostgreSQL connection string used by
+`asyncpg`. They are different values. Market quotes, candles, search,
+screeners, and live ticks do not require Supabase or PostgreSQL. Replace the
+`YOUR_DB_PASSWORD` placeholder only if you re-enable database-backed
+features.
+
+The web app is JavaScript-only: its pages and components use `.jsx`, server
+handlers and helpers use `.js`, and its path alias is configured in
+`web/jsconfig.json`. There is no `tsconfig.json`, `next-env.d.ts`, or
+TypeScript package in the web project.
 
 ## What's still stubbed, on purpose
 
@@ -163,22 +241,66 @@ python main.py
 - Depth-of-market beyond top-of-book - no free feed actually provides
   real multi-level depth; `side_panel.py` says so rather than faking it.
 
-## Re-enabling login
+## Supabase features remain dormant
 
-Orders and server-synced watchlists are still behind Supabase auth - the
-code's intact, just dormant, from before the web frontend existed. With
-no frontend anymore, re-enabling it means wiring the TUI to carry a
-bearer token (`tui/app/client.py` would need an `Authorization` header)
-rather than restoring `/login` - there's no browser session to put it in.
+Orders and server-synced watchlists still require Supabase user JWTs and
+row-level security. The Next.js access password described below protects
+the read-only market terminal; it does not create a Supabase user session
+or enable the dormant order/watchlist routers. The website's watchlist is
+local to each browser.
+
+## Web deployment and credentials
+
+The website is read-only and uses a shared access password. The password is
+checked on the Next.js server; authenticated browser sessions are held in a
+signed, HttpOnly cookie. Browser requests go through a Next.js server route
+that allowlists the market-data endpoints. In production, configure
+`TERMINAL_BACKEND_TOKEN` and `TERMINAL_WS_SECRET` in **both** the backend
+and Next.js hosting environments with matching random values. The backend
+also requires a unique `APP_SECRET_KEY` in production (the development
+fallback is rejected). The backend then rejects direct market API requests
+without the server token, and the WebSocket accepts only short-lived tickets
+signed by the Next.js server.
+
+Keep `FINNHUB_API_KEY` in `backend/.env` or the backend host's secret manager.
+Keep `TERMINAL_ACCESS_PASSWORD`, `TERMINAL_SESSION_SECRET`,
+`TERMINAL_BACKEND_TOKEN`, and `TERMINAL_WS_SECRET` in the Next.js host's
+server-side environment settings. Never use a `NEXT_PUBLIC_` prefix for
+these values, never put them in client code, and never commit `.env` files.
+Yahoo Finance and CoinGecko need no key; Finnhub is optional. Anyone with
+the shared website password uses the same backend provider quota. This is
+how you can let people use the hosted terminal with your backend's optional
+Finnhub key without giving them the `.env` file. Give them the website URL
+and the access password only; never distribute `FINNHUB_API_KEY`, the
+backend token, or the session/WebSocket secrets.
+
+A person who clones the repository to run the Python TUI locally starts
+their own backend and uses their own optional provider key. Yahoo Finance
+and CoinGecko work without a key. The TUI is not configured to connect to
+the password-gated hosted backend as a remote multi-user client.
+
+The web watchlist is saved in that user's browser and is not synced to the
+local TUI or to other users.
+
+For local development, leave the two backend gate values empty in both
+`.env` files; the protected proxy still requires the website password, but
+the local API remains available to the standalone TUI. For production, set
+matching non-empty values on both servers and restrict backend network
+ingress to the Next.js host where your hosting provider allows it.
+
+There is no broker connection in this repository. Orders are login-gated
+behind dormant Supabase configuration and live broker routing is not
+implemented; the website does not expose an order-entry workflow.
 
 ## Next steps, in roadmap order
 
-1. If you want trading/persistence back: wire TUI auth (above), or build
-   a new frontend against the still-intact `/api/orders`/`/api/watchlists`.
+1. If you want trading/persistence back: wire TUI auth or the Next.js
+   frontend against the still-intact `/api/orders`/`/api/watchlists` only
+   after restoring proper user auth and connecting a supported broker.
 2. Add persistent alert evaluation/notifications and an economic-calendar
    router - the database schema is ready.
 3. Real multi-level depth, if you ever add a licensed data source that
-   actually provides it (see `API_KEYS.md` - none of the free ones do).
+   actually provides it (see `api_keys.md` - none of the free ones do).
 4. A matrix-rain decorative flourish in the TUI, if you want the look
    pushed further - the banner/theme/ticker-tape carry the aesthetic now,
    deliberately kept simple so the data panels stayed the priority.
