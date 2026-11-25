@@ -35,30 +35,68 @@ async def ticks_ws(websocket: WebSocket) -> None:
     Fanout is in-process (see services/pubsub.py) - each connection owns
     one asyncio.Queue, subscribed to however many symbol channels it
     wants; publishing a tick just drops it into every subscribed queue.
+
+    Rejections always accept() first and then close() with a real code
+    and reason, instead of closing pre-accept. Closing before accept is
+    interpreted inconsistently across ASGI runtimes (some turn it into a
+    bare HTTP 403 during the upgrade, others just drop the socket) - on
+    the wire that is indistinguishable from a network failure, which is
+    exactly the bare "WebSocket connection failed" a browser shows with
+    no code, no reason, and nothing to go on. Accepting first guarantees
+    a real, inspectable RFC6455 close handshake on every platform. Every
+    rejection is also logged with its reason - check the deployment's
+    logs first when a client can't connect at all.
     """
     settings = get_settings()
-    if settings.terminal_ws_secret:
-        origin = websocket.headers.get("origin", "").rstrip("/")
-        expected_origin = settings.frontend_origin.rstrip("/")
-        if not origin or origin != expected_origin:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-        ticket = websocket.query_params.get("ticket", "")
-        try:
-            payload = jwt.decode(ticket, settings.terminal_ws_secret, algorithms=["HS256"])
-            if payload.get("scope") != "market_ticks":
-                raise JWTError("wrong scope")
-        except JWTError:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-
     client_ip = websocket.client.host if websocket.client else "unknown"
-    if _connections_per_ip.get(client_ip, 0) >= MAX_CONNECTIONS_PER_IP:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+
+    async def reject(reason: str, code: int = status.WS_1008_POLICY_VIOLATION) -> None:
+        logger.warning(json.dumps({"event": "ws_reject", "reason": reason, "client_ip": client_ip}))
+        try:
+            await websocket.accept()
+            await websocket.close(code=code, reason=reason[:120])
+        except Exception:
+            pass
+
+    try:
+        if settings.terminal_ws_secret:
+            # FRONTEND_ORIGIN may list several allowed origins, comma-separated
+            # (e.g. a production domain plus Vercel preview URLs) - matched
+            # exactly (scheme + host + port), trailing slash ignored.
+            allowed_origins = {
+                candidate.strip().rstrip("/")
+                for candidate in settings.frontend_origin.split(",")
+                if candidate.strip()
+            }
+            origin = websocket.headers.get("origin", "").rstrip("/")
+            if not origin or origin not in allowed_origins:
+                await reject(f"origin_mismatch got={origin or '(none)'} allowed={sorted(allowed_origins)}")
+                return
+
+            ticket = websocket.query_params.get("ticket", "")
+            try:
+                payload = jwt.decode(ticket, settings.terminal_ws_secret, algorithms=["HS256"])
+                if payload.get("scope") != "market_ticks":
+                    raise JWTError("wrong scope")
+            except JWTError as exc:
+                await reject(f"ticket_invalid {exc}")
+                return
+
+        if _connections_per_ip.get(client_ip, 0) >= MAX_CONNECTIONS_PER_IP:
+            await reject("per_ip_connection_limit", code=status.WS_1013_TRY_AGAIN_LATER)
+            return
+    except Exception as exc:  # noqa: BLE001 - never let a validation bug surface as a dropped socket
+        logger.error(json.dumps({"event": "ws_reject", "reason": "unexpected_error", "error": str(exc)}))
+        try:
+            await websocket.accept()
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        except Exception:
+            pass
         return
 
     await websocket.accept()
     _connections_per_ip[client_ip] = _connections_per_ip.get(client_ip, 0) + 1
+    logger.info(json.dumps({"event": "ws_connect", "client_ip": client_ip}))
 
     queue: asyncio.Queue[str] = asyncio.Queue()
     subscribed: set[str] = set()

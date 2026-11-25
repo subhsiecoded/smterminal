@@ -1,5 +1,6 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import MarketChart from "./market-chart";
 const DEFAULT_SYMBOLS = ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "^NSEI", "^NSEBANK", "BTC-USD", "AAPL"];
 const INTERVALS = ["1m", "5m", "15m", "1h", "1d", "1w"];
 const CATEGORIES = ["gainers", "losers", "active", "turnover", "unusual-volume", "all"];
@@ -278,7 +279,13 @@ export default function Terminal() {
                     }
                 };
                 socket.onerror = () => setStatus("reconnecting");
-                socket.onclose = () => {
+                socket.onclose = (event) => {
+                    // The backend now always completes the handshake and closes
+                    // with a real code + reason (see backend/app/ws/gateway.py),
+                    // so a rejection is visible here instead of a bare failure.
+                    if (event.code !== 1000 && event.reason) {
+                        console.warn(`[live stream] closed: ${event.code} ${event.reason}`);
+                    }
                     if (heartbeatTimer)
                         window.clearInterval(heartbeatTimer);
                     if (cancelled || manualDisconnect.current)
@@ -604,9 +611,13 @@ export default function Terminal() {
             </div>
           </div>
           <div className="chart-viewport" ref={chartViewport}>
-            {chart.lines.length ? (<pre className="ascii-chart" aria-label={`${selected} historical price chart`}>
-                {chart.lines.map((line, row) => <span className="chart-line" key={row}>{line.map((char, column) => <span key={column} className={chart.directions[column] ? "chart-up" : "chart-down"}>{char}</span>)}</span>)}
-              </pre>) : <div className="chart-empty">{busy ? "FETCHING MARKET HISTORY…" : "NO CANDLE DATA · SELECT A SYMBOL OR CHECK API CONNECTION"}</div>}
+            <MarketChart
+              candles={candles}
+              symbol={selected}
+              interval={interval}
+              loading={busy}
+              livePrice={selectedQuote?.ltp}
+            />
           </div>
           <div className="chart-axis"><span>{candles[0]?.ts ? new Date(candles[0].ts).toLocaleDateString() : "—"}</span><span>{candles.length ? `${candles.length} BARS · ${interval.toUpperCase()}` : "WAITING FOR DATA"}</span><span>{candles[candles.length - 1]?.ts ? new Date(candles[candles.length - 1].ts).toLocaleDateString() : "—"}</span></div>
           <div className="indicator-row">

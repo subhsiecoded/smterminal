@@ -65,7 +65,7 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--green); out
 .interval-tabs button:hover { color: var(--green); }
 .interval-tabs button.selected { border-color: #006622; background: #00250f; color: var(--green); }
 .interval-tabs .refresh-chart { font-size: 15px; padding: 2px 7px; color: var(--green-soft); }
-.chart-viewport { flex: 1; min-height: 180px; overflow: hidden; display: flex; align-items: center; border-top: 1px solid #00190c; border-bottom: 1px solid #00190c; padding: 12px 0; }
+.chart-viewport { flex: 1; min-height: 180px; overflow: hidden; display: flex; align-items: stretch; border-top: 1px solid #00190c; border-bottom: 1px solid #00190c; padding: 12px 0; }
 .ascii-chart { width: 100%; margin: 0; overflow: hidden; font-size: clamp(8px, .85vw, 13px); line-height: 1.14; letter-spacing: .02em; white-space: pre; }
 .chart-line { display: block; height: 1.14em; }
 .chart-up { color: var(--green); }
@@ -75,6 +75,81 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--green); out
 .indicator-row { display: flex; gap: clamp(12px, 3vw, 36px); align-items: center; flex-wrap: wrap; min-height: 31px; border-top: 1px solid var(--green-line); color: var(--green-soft); font-size: 10px; padding: 5px 2px; }
 .indicator-row b { color: var(--green); font-weight: 500; margin-left: 4px; }
 .chart-note { color: #66502b; font-size: 8px; letter-spacing: .045em; padding: 4px 2px 0; }
+
+/* === Interactive OHLCV chart (candles/line/area, crosshair hover, drag-pan, scroll-zoom) === */
+.market-chart { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; gap: 7px; }
+.market-chart-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; }
+.chart-control-group { display: flex; align-items: center; gap: 3px; }
+.chart-control-group button {
+  border: 1px solid var(--green-line);
+  background: #000;
+  color: var(--green-dim);
+  padding: 5px 9px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .05em;
+  cursor: pointer;
+  transition: color .15s ease, border-color .15s ease, background-color .15s ease, box-shadow .15s ease, transform .1s ease;
+}
+.chart-control-group button:hover { color: var(--green); border-color: var(--green-soft); background: #001d0c; box-shadow: 0 0 9px rgba(0, 255, 65, .22); transform: translateY(-1px); }
+.chart-control-group button:active { transform: translateY(0); box-shadow: none; }
+.chart-control-group button.active { border-color: var(--green); background: #00250f; color: var(--green); box-shadow: 0 0 10px rgba(0, 255, 65, .25) inset; }
+.chart-indicator-controls button.sma-key.active { border-color: #e6c84f; color: #e6c84f; box-shadow: 0 0 10px rgba(230, 200, 79, .25) inset; }
+.chart-indicator-controls button.ema12-key.active { border-color: #48c8ff; color: #48c8ff; box-shadow: 0 0 10px rgba(72, 200, 255, .25) inset; }
+.chart-indicator-controls button.ema26-key.active { border-color: #c084fc; color: #c084fc; box-shadow: 0 0 10px rgba(192, 132, 252, .25) inset; }
+.chart-zoom-controls button { font-size: 13px; padding: 3px 10px; line-height: 1; }
+
+.market-chart-stage { position: relative; flex: 1; min-height: 200px; overflow: hidden; cursor: crosshair; touch-action: none; }
+.market-chart-stage.is-dragging { cursor: grabbing; }
+.market-chart-canvas { display: block; width: 100%; height: 100%; }
+
+.market-chart-tooltip {
+  position: absolute;
+  z-index: 3;
+  min-width: 168px;
+  border: 1px solid var(--green-soft);
+  background: rgba(0, 10, 4, .94);
+  padding: 7px 9px;
+  pointer-events: none;
+  box-shadow: 0 0 18px rgba(0, 255, 65, .22);
+  animation: chart-tooltip-in .12s ease-out;
+}
+@keyframes chart-tooltip-in { from { opacity: 0; transform: translateY(-4px) scale(.96); } to { opacity: 1; transform: translateY(0) scale(1); } }
+.market-chart-tooltip .tooltip-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; border-bottom: 1px solid var(--green-line); padding-bottom: 5px; margin-bottom: 5px; }
+.market-chart-tooltip .tooltip-head b { color: var(--green); font-size: 10px; letter-spacing: .04em; }
+.market-chart-tooltip .tooltip-head span { color: var(--green-dim); font-size: 9px; }
+.market-chart-tooltip .tooltip-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 12px; font-size: 9px; color: var(--green-soft); }
+.market-chart-tooltip .tooltip-grid b { font-weight: 600; color: var(--green-soft); margin-left: 3px; }
+.market-chart-tooltip .tooltip-grid b.positive { color: var(--green) !important; }
+.market-chart-tooltip .tooltip-grid b.negative { color: var(--red) !important; }
+.market-chart-tooltip .tooltip-volume { grid-column: 1 / -1; border-top: 1px solid var(--green-line); padding-top: 4px; margin-top: 2px; }
+
+.chart-empty-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  color: var(--green-dim);
+  font-size: 10px;
+  letter-spacing: .09em;
+  animation: chart-pulse 1.8s ease-in-out infinite;
+}
+@keyframes chart-pulse { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
+
+.chart-interaction-hint {
+  position: absolute;
+  right: 8px;
+  bottom: 6px;
+  color: var(--green-dim);
+  font-size: 8px;
+  letter-spacing: .06em;
+  opacity: 0;
+  transition: opacity .2s ease;
+  pointer-events: none;
+}
+.market-chart-stage:hover .chart-interaction-hint { opacity: .85; }
 
 .side-panel { width: 286px; min-width: 286px; border-left: 2px solid var(--green-line); display: flex; flex-direction: column; overflow: hidden; background: #000; }
 .panel-reset { border: 0; background: transparent; color: var(--green-soft); cursor: pointer; font-size: 14px; }
@@ -219,6 +294,9 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--green); out
   .interval-tabs button { padding: 5px 5px; }
   .chart-viewport { min-height: 235px; }
   .ascii-chart { font-size: 8px; }
+  .market-chart-controls { gap: 5px 8px; }
+  .chart-control-group button { padding: 5px 7px; font-size: 8px; }
+  .chart-interaction-hint { display: none; }
   .indicator-row { gap: 10px; font-size: 9px; }
   .ticker-tape { position: static; }
   .command-area { position: sticky; bottom: 0; z-index: 3; }

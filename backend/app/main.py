@@ -33,6 +33,12 @@ if settings.environment.lower() == "production":
             ("TERMINAL_WS_SECRET", settings.terminal_ws_secret),
         ) if not is_strong_secret(value)
     ]
+    # FRONTEND_ORIGIN isn't a secret, but left at its local-dev default it
+    # fails every WebSocket upgrade in production (the gateway's origin
+    # check never matches), silently and with no server-side signal until
+    # now - so it gets the same fail-fast treatment as the secrets above.
+    if settings.frontend_origin.rstrip("/") in ("", "http://localhost:3000"):
+        missing_security.append("FRONTEND_ORIGIN (still set to its local-dev default)")
     if missing_security:
         raise RuntimeError(
             "Production web deployment requires " + ", ".join(missing_security)
