@@ -6,7 +6,7 @@ candle, indicator, screener and live-tick APIs. Global tickers; no broker
 account is required for market research.
 
 ```
-backend/   FastAPI market-data engine; no Redis or database required for market data
+backend/   FastAPI market-data engine; no database required for market data
 tui/       Python Textual terminal for a local terminal emulator
 web/       Next.js browser terminal (JavaScript/JSX only; no TypeScript)
 api_keys.md  Provider keys: what's wired in, what's optional, and what's not used
@@ -66,43 +66,12 @@ The backend's market features include:
   relevant to this app, what's actually wired in, and what's just a
   credible alternative if you want it.
 
-## No Redis - dropped entirely, not relocated
 
-An earlier pass added Redis for caching and pub/sub, with a comment that
-it'd let the app scale across multiple processes someday. It never
-actually needed to for this deployment - everything (the poller, the
-optional Finnhub overlay, the WS gateway, every HTTP route) runs in one
-Python process - so Redis was pure setup friction for zero present
-benefit. It's gone:
-
-- **`app/services/memory_store.py`** - a plain in-process dict with
-  per-key TTLs, replacing Redis for quote/candle/movers caching.
-- **`app/services/pubsub.py`** - in-process publish/subscribe (each WS
-  connection owns one `asyncio.Queue`), replacing Redis pub/sub for
-  fanning ticks out to connected clients.
-- Rate limiting now uses slowapi's in-memory storage instead of a
-  Redis-backed one.
-
-**The whole backend now runs with zero external services** - `pip
-install -r requirements.txt && uvicorn app.main:app` and that's it. No
-Redis, no Postgres, no Docker, nothing to have running in another window.
-(This does mean it's single-process only now - fine for personal use;
-if you ever actually need multiple backend replicas, that's the one
-place Redis would need to come back, and `rate_limit.py`'s and
-`memory_store.py`'s own comments say so.)
-
-Proven, not just asserted: the app was imported and fully exercised -
-every route, the WS gateway, rate limiting - with the `redis` Python
-package **uninstalled from the environment entirely**, so there's no
-way a leftover import could be silently making this still secretly
-depend on it.
 
 ## Verified, not just written - this pass specifically
 
-- **A real connection-handling bug** (caught earlier, when Redis was
-  still in the picture): `relay_ticks` called `pubsub.get_message()`
-  before any `subscribe()` had happened, which redis-py treats as an
-  error, silently killing every connection. Fixed and re-verified then;
+- **A real connection-handling bug** : `relay_ticks` called `pubsub.get_message()`
+  before any `subscribe()` had happened, , silently killing every connection. Fixed and re-verified then;
   moot now that the WS gateway's fanout is in-process instead.
 - **A test-harness artifact caught and rejected, not trusted**: verifying
   the new in-process pub/sub with Starlette's `TestClient` produced an

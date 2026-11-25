@@ -7,23 +7,57 @@ const CATEGORIES = ["gainers", "losers", "active", "turnover", "unusual-volume",
 const RESERVED = new Set(["INDIA-MOVERS", "INDIA", "SCREENER", "NSE", "MOVERS", "GAINERS", "LOSERS", "ACTIVE", "TURNOVER", "UNUSUAL-VOLUME"]);
 const SYMBOL_RE = /^[A-Z0-9^][A-Z0-9.^=_-]{0,31}$/;
 const BLOCKS = " ▁▂▃▄▅▆▇█";
+function emitAppNotice(notice) {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(new CustomEvent("smterminal:notice", {
+        detail: {
+            level: "error",
+            title: "Application error",
+            message: "Something went wrong. Please try again.",
+            source: "APPLICATION",
+            ...notice,
+        },
+    }));
+}
+
 async function api(path, init) {
-    const response = await fetch(`/api/backend/${path.replace(/^\//, "")}`, {
-        ...init,
-        cache: "no-store",
-        headers: { ...(init?.headers || {}) }
-    });
+    const endpoint = `/api/backend/${path.replace(/^\//, "")}`;
+    let response;
+    try {
+        response = await fetch(endpoint, {
+            ...init,
+            cache: "no-store",
+            headers: { ...(init?.headers || {}) },
+        });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : "Network request failed";
+        emitAppNotice({
+            title: "Backend connection interrupted",
+            message: "The market-data service could not be reached. The terminal will keep the last available data and retry on the next refresh.",
+            detail: `${endpoint} · ${message}`,
+            source: "API / NETWORK",
+            level: "error",
+        });
+        throw new Error(message || "Market-data backend is unreachable");
+    }
+
     let payload;
     try {
         payload = await response.json();
-    }
-    catch {
+    } catch {
         payload = null;
     }
     if (!response.ok) {
         const detail = payload && typeof payload === "object" && "detail" in payload
             ? String(payload.detail)
             : `Request failed (${response.status})`;
+        emitAppNotice({
+            title: response.status >= 500 ? "Backend service error" : "Request could not be completed",
+            message: detail,
+            detail: `${endpoint} · HTTP ${response.status}`,
+            source: "MARKET DATA API",
+            level: response.status >= 500 ? "error" : "warning",
+        });
         throw new Error(detail);
     }
     return payload;
@@ -116,6 +150,11 @@ export default function Terminal() {
     const [sideMode, setSideMode] = useState("topbook");
     const [sideTitle, setSideTitle] = useState("TOP OF BOOK");
     const [sideData, setSideData] = useState(null);
+    const [activeSideTab, setActiveSideTab] = useState("topbook");
+    const [lastSearchQuery, setLastSearchQuery] = useState("");
+    const [sideLoading, setSideLoading] = useState(false);
+    const [sideError, setSideError] = useState("");
+    const [notices, setNotices] = useState([]);
     const [screenerOpen, setScreenerOpen] = useState(false);
     const [screener, setScreener] = useState(null);
     const [screenerCategory, setScreenerCategory] = useState("gainers");
@@ -128,6 +167,8 @@ export default function Terminal() {
     const chartViewport = useRef(null);
     const [chartWidth, setChartWidth] = useState(96);
     const wsRef = useRef(null);
+    const chartRequestId = useRef(0);
+    const sideRequestId = useRef(0);
     const wantedSymbols = useRef([...DEFAULT_SYMBOLS]);
     const previousSymbols = useRef([...DEFAULT_SYMBOLS]);
     const mounted = useRef(false);
@@ -171,10 +212,14 @@ export default function Terminal() {
         const ws = wsRef.current;
         if (ws?.readyState === WebSocket.OPEN) {
             const next = wantedSymbols.current;
-            ws.send(JSON.stringify({
-                subscribe: next.filter((symbol) => !previousSymbols.current.includes(symbol)),
-                unsubscribe: previousSymbols.current.filter((symbol) => !next.includes(symbol))
-            }));
+            try {
+                ws.send(JSON.stringify({
+                    subscribe: next.filter((symbol) => !previousSymbols.current.includes(symbol)),
+                    unsubscribe: previousSymbols.current.filter((symbol) => !next.includes(symbol))
+                }));
+            } catch {
+                ws.close(4000, "subscription update failed");
+            }
         }
         previousSymbols.current = [...wantedSymbols.current];
     }, [watchlist, selected]);
@@ -183,6 +228,54 @@ export default function Terminal() {
         const id = window.setInterval(() => setClock(new Date()), 1000);
         return () => window.clearInterval(id);
     }, []);
+    useEffect(() => {
+        const addNotice = (detail) => {
+            const normalized = {
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                createdAt: Date.now(),
+                level: detail?.level || "error",
+                title: detail?.title || "Application error",
+                message: detail?.message || "Something went wrong.",
+                detail: detail?.detail || "",
+                source: detail?.source || "APPLICATION",
+            };
+            setNotices((current) => {
+                const duplicate = current.some((item) => item.title === normalized.title && item.message === normalized.message && Date.now() - item.createdAt < 300000);
+                if (duplicate) return current;
+                return [...current, normalized].slice(-4);
+            });
+        };
+        const onNotice = (event) => addNotice(event.detail || {});
+        const onWindowError = (event) => addNotice({
+            title: "Unexpected application error",
+            message: "A frontend component encountered an unexpected error. You can continue using other terminal panels.",
+            detail: `${event.message || "Unknown error"}${event.filename ? ` · ${event.filename}:${event.lineno || 0}` : ""}`,
+            source: "BROWSER RUNTIME",
+            level: "error",
+        });
+        const onUnhandledRejection = (event) => addNotice({
+            title: "Background task failed",
+            message: "A background operation did not complete successfully.",
+            detail: event.reason instanceof Error ? event.reason.message : String(event.reason || "Unknown rejection"),
+            source: "ASYNC RUNTIME",
+            level: "error",
+        });
+        window.addEventListener("smterminal:notice", onNotice);
+        window.addEventListener("error", onWindowError);
+        window.addEventListener("unhandledrejection", onUnhandledRejection);
+        return () => {
+            window.removeEventListener("smterminal:notice", onNotice);
+            window.removeEventListener("error", onWindowError);
+            window.removeEventListener("unhandledrejection", onUnhandledRejection);
+        };
+    }, []);
+    useEffect(() => {
+        if (!notices.length) return undefined;
+        const timers = notices.map((notice) => window.setTimeout(() => {
+            setNotices((current) => current.filter((item) => item.id !== notice.id));
+        }, notice.level === "error" ? 12000 : 8000));
+        return () => timers.forEach((timer) => window.clearTimeout(timer));
+    }, [notices]);
     useEffect(() => {
         const element = chartViewport.current;
         if (!element)
@@ -215,24 +308,31 @@ export default function Terminal() {
         }
     }, [watchlist, selected]);
     const refreshChart = useCallback(async () => {
+        const requestId = ++chartRequestId.current;
         setBusy(true);
         try {
             const [history, technicals] = await Promise.all([
                 api(`market/candles/${encodeURIComponent(selected)}?interval=${interval}`),
                 api(`market/indicators/${encodeURIComponent(selected)}?interval=${interval}`)
             ]);
+            if (requestId !== chartRequestId.current) return;
             if (!Array.isArray(history)) throw new Error("The market API returned an invalid candle payload");
             setCandles(history.filter((row) => row && typeof row === "object"));
             setIndicators(technicals && typeof technicals === "object" ? technicals : {});
             setFeedback(`chart refreshed · ${selected} · ${interval}`);
         }
         catch (error) {
+            if (requestId !== chartRequestId.current) return;
             setCandles([]);
             setIndicators({});
-            setFeedback(`[chart] ${error instanceof Error ? error.message : "Unable to load chart"}`);
+            const message = error instanceof Error ? error.message : "Unable to load chart";
+            setFeedback(`[chart] ${message}`);
+            if (message.includes("invalid candle payload")) {
+                emitAppNotice({ title: "Chart data format error", message: "The backend returned candle data in an unexpected format. The chart has been isolated and will retry on its next refresh.", detail: message, source: "OHLC DATA VALIDATION", level: "error" });
+            }
         }
         finally {
-            setBusy(false);
+            if (requestId === chartRequestId.current) setBusy(false);
         }
     }, [selected, interval]);
     useEffect(() => {
@@ -251,8 +351,10 @@ export default function Terminal() {
         let socket = null;
         let retryTimer = null;
         let heartbeatTimer = null;
+        let connectionTimer = null;
         let backoff = 1000;
         let lastHeartbeat = Date.now();
+        let ticketInFlight = false;
 
         const clearHeartbeat = () => {
             if (heartbeatTimer !== null) {
@@ -260,22 +362,42 @@ export default function Terminal() {
                 heartbeatTimer = null;
             }
         };
-
-        const scheduleReconnect = () => {
+        const clearConnectionTimer = () => {
+            if (connectionTimer !== null) {
+                window.clearTimeout(connectionTimer);
+                connectionTimer = null;
+            }
+        };
+        const scheduleReconnect = (minimumDelay = 0) => {
             if (cancelled || manualDisconnect.current || retryTimer !== null) return;
+            if (typeof navigator !== "undefined" && !navigator.onLine) {
+                setStatus("offline");
+                return;
+            }
             setStatus("reconnecting");
+            const jitter = Math.floor(Math.random() * Math.min(1800, backoff * 0.2));
+            const delay = Math.max(minimumDelay, backoff + jitter);
             retryTimer = window.setTimeout(() => {
                 retryTimer = null;
-                backoff = Math.min(backoff * 2, 15000);
+                backoff = Math.min(Math.round(backoff * 1.8), 60000);
                 void connect();
-            }, backoff);
+            }, delay);
         };
 
         const connect = async () => {
-            if (cancelled || manualDisconnect.current) return;
+            if (cancelled || manualDisconnect.current || ticketInFlight) return;
+            if (typeof navigator !== "undefined" && !navigator.onLine) {
+                setStatus("offline");
+                return;
+            }
+            if (socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState)) return;
+            ticketInFlight = true;
             setStatus(backoff > 1000 ? "reconnecting" : "connecting");
             try {
-                const response = await fetch("/api/ws-ticket", { cache: "no-store" });
+                const response = await fetch("/api/ws-ticket", {
+                    cache: "no-store",
+                    signal: AbortSignal.timeout(12000),
+                });
                 const config = await response.json().catch(() => ({}));
                 if (cancelled) return;
 
@@ -287,15 +409,25 @@ export default function Terminal() {
                     const message = typeof config.detail === "string" ? config.detail : `Live-stream setup failed (${response.status})`;
                     setStatus("error");
                     setFeedback(`[live stream] ${message}`);
-                    // A 503 from this route means deployment configuration is
-                    // incomplete; retrying cannot repair a missing server secret or URL.
-                    if (response.status !== 503) scheduleReconnect();
+                    emitAppNotice({
+                        title: "Live connection setup failed",
+                        message: response.status >= 500
+                            ? "The terminal cannot establish its live feed right now. It will retry automatically."
+                            : message,
+                        detail: `GET /api/ws-ticket · HTTP ${response.status} · ${message}`,
+                        source: "LIVE STREAM",
+                        level: "error",
+                    });
+                    scheduleReconnect(response.status === 503 ? 20000 : response.status >= 500 || response.status === 429 ? 5000 : 30000);
                     return;
                 }
 
                 if (typeof config.wsBaseUrl !== "string" || !config.wsBaseUrl.trim()) {
                     setStatus("error");
-                    setFeedback("[live stream] backend WSS URL is missing; configure MARKET_TERMINAL_WS_BASE_URL on the web deployment");
+                    const message = "Backend WSS URL is missing. Configure MARKET_TERMINAL_WS_BASE_URL on the web deployment.";
+                    setFeedback(`[live stream] ${message}`);
+                    emitAppNotice({ title: "Live feed is not configured", message, source: "LIVE STREAM CONFIG", detail: "MARKET_TERMINAL_WS_BASE_URL is empty", level: "error" });
+                    scheduleReconnect(30000);
                     return;
                 }
 
@@ -303,28 +435,37 @@ export default function Terminal() {
                 try {
                     baseUrl = new URL(config.wsBaseUrl);
                 } catch {
+                    const message = "The configured backend WebSocket URL is invalid.";
                     setStatus("error");
-                    setFeedback("[live stream] MARKET_TERMINAL_WS_BASE_URL is not a valid WebSocket URL");
+                    setFeedback(`[live stream] ${message}`);
+                    emitAppNotice({ title: "Invalid live-feed URL", message, source: "LIVE STREAM CONFIG", detail: String(config.wsBaseUrl), level: "error" });
+                    scheduleReconnect(30000);
                     return;
                 }
                 const securePage = window.location.protocol === "https:";
-                if (!(["ws:", "wss:"].includes(baseUrl.protocol)) || (securePage && baseUrl.protocol !== "wss:")) {
+                if (!( ["ws:", "wss:"].includes(baseUrl.protocol) ) || (securePage && baseUrl.protocol !== "wss:") || baseUrl.username || baseUrl.password) {
+                    const message = "An HTTPS website requires a valid public WSS backend URL.";
                     setStatus("error");
-                    setFeedback("[live stream] an HTTPS website requires a valid WSS backend URL");
+                    setFeedback(`[live stream] ${message}`);
+                    emitAppNotice({ title: "Insecure live-feed configuration", message, source: "LIVE STREAM CONFIG", detail: `Configured protocol: ${baseUrl.protocol}`, level: "error" });
+                    scheduleReconnect(30000);
                     return;
                 }
 
-                const url = new URL(`${baseUrl.origin}/ws/ticks`);
-                if (typeof config.ticket === "string" && config.ticket) {
-                    url.searchParams.set("ticket", config.ticket);
-                }
-
+                const url = new URL("/ws/ticks", baseUrl.origin);
+                if (typeof config.ticket === "string" && config.ticket) url.searchParams.set("ticket", config.ticket);
                 const candidate = new WebSocket(url.toString());
                 socket = candidate;
                 wsRef.current = candidate;
+                clearConnectionTimer();
+                connectionTimer = window.setTimeout(() => {
+                    if (candidate.readyState === WebSocket.CONNECTING) candidate.close(4000, "connection handshake timeout");
+                }, 12000);
+
                 candidate.onopen = () => {
+                    clearConnectionTimer();
                     if (cancelled || wsRef.current !== candidate) {
-                        candidate.close();
+                        candidate.close(1000, "stale connection");
                         return;
                     }
                     backoff = 1000;
@@ -333,7 +474,7 @@ export default function Terminal() {
                     try {
                         candidate.send(JSON.stringify({ subscribe: wantedSymbols.current }));
                     } catch {
-                        candidate.close();
+                        candidate.close(4000, "subscription send failed");
                     }
                 };
                 candidate.onmessage = (event) => {
@@ -344,58 +485,103 @@ export default function Terminal() {
                             lastHeartbeat = Date.now();
                             return;
                         }
-                        if (typeof message.symbol === "string") {
+                        if (typeof message.symbol === "string" && message.symbol.length <= 32) {
                             setQuotes((current) => ({
                                 ...current,
-                                [message.symbol]: { ...current[message.symbol], ...message }
+                                [message.symbol]: { ...current[message.symbol], ...message },
                             }));
                         }
                     } catch {
-                        // Ignore malformed provider frames; a bad tick must not crash the UI.
+                        // Invalid provider frames are isolated from the React render cycle.
                     }
                 };
                 candidate.onerror = () => {
                     if (!cancelled && wsRef.current === candidate) setStatus("reconnecting");
                 };
                 candidate.onclose = (event) => {
+                    clearConnectionTimer();
                     clearHeartbeat();
                     if (wsRef.current === candidate) wsRef.current = null;
                     if (cancelled || manualDisconnect.current) return;
 
-                    // Policy/protocol closes are configuration or request errors,
-                    // not transient network failures. Stop here to prevent an
-                    // infinite reconnect loop and surface the backend's reason.
                     if ([1002, 1003, 1007, 1008].includes(event.code)) {
                         setStatus("error");
-                        setFeedback(`[live stream] rejected (${event.code}) ${event.reason || "Check FRONTEND_ORIGIN and matching TERMINAL_WS_SECRET values on both deployments."}`);
+                        const reason = event.reason || "The backend rejected this WebSocket handshake.";
+                        setFeedback(`[live stream] rejected (${event.code}) ${reason}`);
+                        emitAppNotice({
+                            title: "Live connection rejected by backend",
+                            message: "The live market feed was refused. The terminal will retry slowly while REST market data remains available; verify the backend origin and WebSocket secret configuration.",
+                            detail: `WebSocket close ${event.code} · ${reason}`,
+                            source: "LIVE STREAM / POLICY",
+                            level: "error",
+                        });
+                        scheduleReconnect(30000);
                         return;
                     }
-
                     if (event.code !== 1000 && event.reason) {
-                        console.warn(`[live stream] closed: ${event.code} ${event.reason}`);
+                        emitAppNotice({
+                            title: "Live connection interrupted",
+                            message: "The live feed disconnected. The terminal is reconnecting automatically.",
+                            detail: `WebSocket close ${event.code} · ${event.reason}`,
+                            source: "LIVE STREAM",
+                            level: "warning",
+                        });
                     }
                     scheduleReconnect();
                 };
 
                 clearHeartbeat();
                 heartbeatTimer = window.setInterval(() => {
-                    if (wsRef.current === candidate && candidate.readyState === WebSocket.OPEN) {
-                        if (Date.now() - lastHeartbeat > 30000) candidate.close();
+                    if (wsRef.current === candidate && candidate.readyState === WebSocket.OPEN && Date.now() - lastHeartbeat > 35000) {
+                        setStatus("stale");
+                        candidate.close(4000, "heartbeat timeout");
                     }
                 }, 5000);
             } catch (error) {
                 if (cancelled || manualDisconnect.current) return;
                 setStatus("reconnecting");
-                if (error instanceof Error) setFeedback(`[live stream] ${error.message}`);
+                const message = error instanceof Error ? error.message : "Could not obtain a live connection ticket";
+                setFeedback(`[live stream] ${message}`);
+                emitAppNotice({
+                    title: "Live feed temporarily unavailable",
+                    message: "The terminal could not start its live connection. It will retry with an increasing delay.",
+                    detail: message,
+                    source: "LIVE STREAM",
+                    level: "warning",
+                });
                 scheduleReconnect();
+            } finally {
+                ticketInFlight = false;
             }
         };
 
+        const onOnline = () => {
+            if (retryTimer !== null) window.clearTimeout(retryTimer);
+            retryTimer = null;
+            backoff = 1000;
+            window.setTimeout(() => {
+                if (!cancelled && (!socket || socket.readyState === WebSocket.CLOSED)) void connect();
+            }, 250);
+        };
+        const onOffline = () => {
+            setStatus("offline");
+            socket?.close(1001, "browser offline");
+        };
+        const onVisibility = () => {
+            if (document.visibilityState === "visible" && (!socket || socket.readyState === WebSocket.CLOSED)) void connect();
+        };
+        window.addEventListener("online", onOnline);
+        window.addEventListener("offline", onOffline);
+        document.addEventListener("visibilitychange", onVisibility);
         void connect();
         return () => {
             cancelled = true;
+            window.removeEventListener("online", onOnline);
+            window.removeEventListener("offline", onOffline);
+            document.removeEventListener("visibilitychange", onVisibility);
             if (retryTimer !== null) window.clearTimeout(retryTimer);
             clearHeartbeat();
+            clearConnectionTimer();
             socket?.close(1000, "component unmounted");
             if (wsRef.current === socket) wsRef.current = null;
         };
@@ -415,6 +601,9 @@ export default function Terminal() {
         return () => window.removeEventListener("keydown", onKey);
     }, [screenerOpen]);
     async function selectSymbol(raw) {
+        sideRequestId.current += 1;
+        setSideLoading(false);
+        setSideError("");
         const symbol = cleanSymbols([raw])[0];
         if (!symbol) {
             setFeedback(`'${raw}' is not a valid ticker symbol`);
@@ -422,6 +611,7 @@ export default function Terminal() {
         }
         setSelected(symbol);
         setSideMode("topbook");
+        setActiveSideTab("topbook");
         setSideTitle("TOP OF BOOK");
         setFeedback(`→ ${symbol}`);
         if (!watchlist.includes(symbol)) {
@@ -546,6 +736,9 @@ export default function Terminal() {
             return;
         setCommand("");
         const { verb, args } = parseCommand(raw);
+        const commandRequestId = ++sideRequestId.current;
+        setSideLoading(false);
+        setSideError("");
         if (["add", "watch"].includes(verb)) {
             if (!args.length)
                 return setFeedback("usage: add SYMBOL");
@@ -565,9 +758,13 @@ export default function Terminal() {
             const query = args.join(" ");
             if (!query)
                 return setFeedback("usage: search QUERY");
+            setLastSearchQuery(query);
             try {
                 const results = await api(`instruments/search?q=${encodeURIComponent(query)}`);
+                if (commandRequestId !== sideRequestId.current) return;
                 setSideMode("search");
+                setActiveSideTab("search");
+                setLastSearchQuery(query);
                 setSideTitle(`SEARCH · ${query.toUpperCase()}`);
                 setSideData(results);
                 setFeedback(results.length ? `${results.length} search matches · select a result to open chart` : `no matches for '${query}'`);
@@ -581,7 +778,9 @@ export default function Terminal() {
             try {
                 const suffix = query ? `?q=${encodeURIComponent(query)}&limit=50` : "?limit=50&offset=0";
                 const payload = await api(`instruments/india${suffix}`);
+                if (commandRequestId !== sideRequestId.current) return;
                 setSideMode("india");
+                setActiveSideTab("nse");
                 setSideTitle(query ? `NSE INDIA · ${query.toUpperCase()}` : "NSE INDIA · BROWSE");
                 setSideData(payload);
                 setFeedback(`browsing NSE (${payload.total} listed) · select a symbol to view chart`);
@@ -596,7 +795,9 @@ export default function Terminal() {
                 return setFeedback("usage: movers gainers|losers|active");
             try {
                 const payload = await api(`market/movers?category=${category}`);
+                if (commandRequestId !== sideRequestId.current) return;
                 setSideMode("movers");
+                setActiveSideTab(category);
                 setSideTitle(`MOVERS · ${category.toUpperCase()}`);
                 setSideData(payload);
                 setFeedback(`showing ${category} · select a symbol to switch back to top-of-book`);
@@ -611,7 +812,9 @@ export default function Terminal() {
         else if (verb === "news") {
             try {
                 const payload = await api(`market/news/${encodeURIComponent(selected)}`);
+                if (commandRequestId !== sideRequestId.current) return;
                 setSideMode("news");
+                setActiveSideTab("news");
                 setSideTitle(`NEWS · ${selected}`);
                 setSideData(payload);
                 setFeedback(`news for ${selected}`);
@@ -644,6 +847,62 @@ export default function Terminal() {
     function clickResult(symbol) {
         void selectSymbol(symbol);
     }
+    async function activateSideTab(tab) {
+        const requestId = ++sideRequestId.current;
+        setActiveSideTab(tab);
+        setSideError("");
+        if (tab === "topbook") {
+            setSideLoading(false);
+            setSideMode("topbook");
+            setSideTitle("TOP OF BOOK");
+            return;
+        }
+        if (tab === "search" && !lastSearchQuery.trim()) {
+            setSideLoading(false);
+            setSideMode("search");
+            setSideTitle("SEARCH · NO QUERY");
+            setSideData([]);
+            setFeedback("enter `search COMPANY OR SYMBOL` in the command bar to populate Search results");
+            return;
+        }
+        setSideLoading(true);
+        try {
+            if (tab === "search") {
+                const payload = await api(`instruments/search?q=${encodeURIComponent(lastSearchQuery)}`);
+                if (requestId !== sideRequestId.current) return;
+                setSideMode("search");
+                setSideTitle(`SEARCH · ${lastSearchQuery.toUpperCase()}`);
+                setSideData(Array.isArray(payload) ? payload : []);
+            } else if (["gainers", "losers", "active"].includes(tab)) {
+                const payload = await api(`market/movers?category=${tab}`);
+                if (requestId !== sideRequestId.current) return;
+                setSideMode("movers");
+                setSideTitle(`MOVERS · ${tab.toUpperCase()}`);
+                setSideData(Array.isArray(payload) ? payload : []);
+            } else if (tab === "nse") {
+                const payload = await api("instruments/india?limit=50&offset=0");
+                if (requestId !== sideRequestId.current) return;
+                setSideMode("india");
+                setSideTitle("NSE INDIA · BROWSE");
+                setSideData(payload);
+            } else if (tab === "news") {
+                const payload = await api(`market/news/${encodeURIComponent(selected)}`);
+                if (requestId !== sideRequestId.current) return;
+                setSideMode("news");
+                setSideTitle(`NEWS · ${selected}`);
+                setSideData(payload);
+            }
+        } catch (error) {
+            if (requestId === sideRequestId.current) {
+                const message = error instanceof Error ? error.message : "Unable to load results";
+                setSideError(message);
+                setFeedback(`[${tab}] ${message}`);
+            }
+        } finally {
+            if (requestId === sideRequestId.current) setSideLoading(false);
+        }
+    }
+
     async function refreshScreener() {
         const params = new URLSearchParams({ category: screenerCategory, series: "EQ", limit: "50", offset: "0", refresh: "true" });
         await loadScreener(screenerCategory, params);
@@ -709,14 +968,20 @@ export default function Terminal() {
           <div className="chart-note">INDICATORS COMPUTED SERVER-SIDE · PRICE DATA IS PROVIDER-SUPPLIED · NOT AN EXECUTION FEED</div>
         </section>
 
-        <aside className="side-panel">
-          <div className="panel-heading"><span>{sideTitle}</span><button className="panel-reset" onClick={() => { setSideMode("topbook"); setSideTitle("TOP OF BOOK"); }}>↺</button></div>
-          {sideMode === "topbook" && <TopBook quote={selectedQuote} symbol={selected}/>}
-          {sideMode === "search" && <InstrumentList items={sideData || []} onSelect={clickResult}/>}
-          {sideMode === "india" && <IndiaList payload={sideData} onSelect={clickResult}/>}
-          {sideMode === "movers" && <MoversList items={sideData || []} onSelect={clickResult}/>}
-          {sideMode === "news" && <NewsList payload={sideData}/>}
-          <div className="side-quick-actions"><button onClick={() => void runCommandFromButton("news")}>NEWS</button><button onClick={() => void runCommandFromButton("movers gainers")}>GAINERS</button><button onClick={() => void runCommandFromButton("india")}>NSE LIST</button></div>
+        <aside className="side-panel" aria-label="Market results">
+          <div className="panel-heading"><span>{sideTitle}</span><button className="panel-reset" title="Reset panel" aria-label="Show top of book" onClick={() => void activateSideTab("topbook")}>↺</button></div>
+          <nav className="side-tabs" role="tablist" aria-label="Market result tabs">
+            {[["topbook", "BOOK"], ["search", "SEARCH"], ["gainers", "GAINERS"], ["losers", "LOSERS"], ["active", "ACTIVE"], ["nse", "NSE"], ["news", "NEWS"]].map(([key, label]) => <button key={key} type="button" role="tab" aria-selected={activeSideTab === key} className={activeSideTab === key ? "active" : ""} onClick={() => void activateSideTab(key)}>{label}</button>)}
+          </nav>
+          <div className="side-panel-content" role="tabpanel">
+            {sideLoading && <div className="side-empty side-loading"><span className="loading-pulse"/> LOADING {activeSideTab.toUpperCase()} RESULTS…</div>}
+            {!sideLoading && sideError && <div className="side-empty side-error-state"><strong>RESULTS UNAVAILABLE</strong><span>{sideError}</span><button type="button" onClick={() => void activateSideTab(activeSideTab)}>RETRY ↻</button></div>}
+            {!sideLoading && !sideError && sideMode === "topbook" && <TopBook quote={selectedQuote} symbol={selected}/>}
+            {!sideLoading && !sideError && sideMode === "search" && <InstrumentList items={sideData || []} onSelect={clickResult}/>}
+            {!sideLoading && !sideError && sideMode === "india" && <IndiaList payload={sideData} onSelect={clickResult}/>}
+            {!sideLoading && !sideError && sideMode === "movers" && <MoversList items={sideData || []} onSelect={clickResult}/>}
+            {!sideLoading && !sideError && sideMode === "news" && <NewsList payload={sideData}/>}
+          </div>
         </aside>
       </section>
 
@@ -739,47 +1004,25 @@ export default function Terminal() {
       {showHelp && <HelpOverlay onClose={() => setShowHelp(false)}/>}
       {screenerOpen && screener && (<ScreenerOverlay payload={screener} category={screenerCategory} rows={visibleScreenerRows} filter={screenerFilter} live={screenerLive} busy={screenerBusy} onFilter={setScreenerFilter} onCategory={(value) => { setScreenerFilter(""); void loadScreener(value); }} onRefresh={() => void refreshScreener()} onLive={() => setScreenerLive((value) => !value)} onSelect={(row) => { setScreenerOpen(false); void selectSymbol(row.symbol); }} onWatch={(row) => addWatchlist([row.symbol])} onDetails={setDetailRow} onClose={() => { setScreenerOpen(false); setDetailRow(null); }}/>)}
       {detailRow && <DetailOverlay row={detailRow} onClose={() => setDetailRow(null)} onSelect={() => { setScreenerOpen(false); setDetailRow(null); void selectSymbol(detailRow.symbol); }} onWatch={() => addWatchlist([detailRow.symbol])}/>}
+      <NotificationCenter notices={notices} onDismiss={(id) => setNotices((current) => current.filter((notice) => notice.id !== id))}/>
     </main>);
-    async function runCommandFromButton(raw) {
-        setCommand(raw);
-        const { verb, args } = parseCommand(raw);
-        if (verb === "news") {
-            try {
-                const payload = await api(`market/news/${encodeURIComponent(selected)}`);
-                setSideMode("news");
-                setSideTitle(`NEWS · ${selected}`);
-                setSideData(payload);
-                setFeedback(`news for ${selected}`);
-            }
-            catch (error) {
-                setFeedback(`[news] ${error instanceof Error ? error.message : "News unavailable"}`);
-            }
-        }
-        else if (verb === "movers") {
-            try {
-                const payload = await api(`market/movers?category=${args[0] || "gainers"}`);
-                setSideMode("movers");
-                setSideTitle(`MOVERS · ${(args[0] || "gainers").toUpperCase()}`);
-                setSideData(payload);
-            }
-            catch (error) {
-                setFeedback(`[movers] ${error instanceof Error ? error.message : "Mover list unavailable"}`);
-            }
-        }
-        else if (verb === "india") {
-            try {
-                const payload = await api("instruments/india?limit=50&offset=0");
-                setSideMode("india");
-                setSideTitle("NSE INDIA · BROWSE");
-                setSideData(payload);
-            }
-            catch (error) {
-                setFeedback(`[india] ${error instanceof Error ? error.message : "NSE list unavailable"}`);
-            }
-        }
-        setCommand("");
-    }
 }
+function NotificationCenter({ notices, onDismiss }) {
+    if (!notices.length) return null;
+    return <div className="notification-stack" aria-live="assertive" aria-relevant="additions">
+      {notices.map((notice) => <article className={`app-notice ${notice.level || "error"}`} role={notice.level === "warning" ? "status" : "alert"} key={notice.id}>
+        <div className="notice-mark" aria-hidden="true">{notice.level === "warning" ? "!" : "×"}</div>
+        <div className="notice-content">
+          <div className="notice-heading"><strong>{notice.title}</strong><span>{(notice.level || "error").toUpperCase()}</span></div>
+          <p>{notice.message}</p>
+          {notice.detail && <details><summary>DIAGNOSTIC DETAILS</summary><code>{notice.detail}</code></details>}
+          <small>{notice.source} · {new Date(notice.createdAt).toLocaleTimeString()}</small>
+        </div>
+        <button type="button" className="notice-close" onClick={() => onDismiss(notice.id)} aria-label="Dismiss notification">×</button>
+      </article>)}
+    </div>;
+}
+
 function TopBook({ quote, symbol }) {
     if (!quote)
         return <div className="side-empty">WAITING FOR A QUOTE…</div>;
@@ -789,7 +1032,7 @@ function TopBook({ quote, symbol }) {
 }
 function InstrumentList({ items, onSelect }) {
     if (!items.length)
-        return <div className="side-empty">NO MATCHES FOUND.</div>;
+        return <div className="side-empty">NO SEARCH RESULTS. TRY `search RELIANCE` OR ANOTHER COMPANY / TICKER.</div>;
     return <div className="side-list">{items.slice(0, 20).map((item) => <button key={`${item.symbol}-${item.exchange || ""}`} onClick={() => onSelect(item.symbol)}><b>{item.symbol}</b><span>{item.name || item.exchange || ""}</span><small>{item.exchange || item.type || "INSTRUMENT"}</small></button>)}</div>;
 }
 function IndiaList({ payload, onSelect }) {
@@ -851,7 +1094,7 @@ function ScreenerOverlay({ payload, category, rows, filter, live, busy, onFilter
     <div className="screener-meta"><span>{meta.quote_count || 0}/{meta.universe_total || 0} SYMBOLS</span><span>{meta.coverage_pct ?? 0}% QUOTE COVERAGE</span><span>SCAN {scanned} UTC</span><span>ADV {meta.advancers ?? 0} / DEC {meta.decliners ?? 0} / FLAT {meta.unchanged ?? 0}</span><span>YAHOO SNAPSHOT · NOT EXCHANGE-CERTIFIED LIVE DATA</span></div>
     <div className="screener-tools"><input value={filter} onChange={(event) => onFilter(event.target.value)} placeholder="Filter visible results by symbol or company…"/><div className="screener-actions">{CATEGORIES.map((value) => <button key={value} className={value === category ? "active" : ""} onClick={() => onCategory(value)}>{value === "unusual-volume" ? "UNUSUAL" : value.toUpperCase()}</button>)}<button onClick={onRefresh} disabled={busy}>{busy ? "SCANNING…" : "↻ REFRESH"}</button><button onClick={onLive}>{live ? "Ⅱ PAUSE" : "▶ LIVE"}</button></div></div>
     <div className="screener-table-wrap"><table className="screener-table"><thead><tr><th>#</th><th>SYMBOL</th><th>COMPANY</th><th>LTP ₹</th><th>CHG %</th><th>VOLUME</th><th>TURNOVER ₹</th><th>RVOL</th><th>ACTIONS</th></tr></thead><tbody>
-      {rows.map((row, index) => <tr key={`${row.symbol}-${index}`}><td>{index + 1}</td><td><button className="table-symbol" onClick={() => onSelect(row)}>{row.nse_symbol || row.symbol}</button></td><td className="company-cell">{row.name || "—"}</td><td>{number(row.ltp)}</td><td className={Number(row.change_pct || 0) >= 0 ? "positive" : "negative"}>{Number(row.change_pct || 0) >= 0 ? "+" : ""}{number(row.change_pct)}%</td><td>{compact(row.volume)}</td><td>{compact(row.turnover)}</td><td>{number(row.relative_volume)}</td><td className="row-actions"><button onClick={() => onDetails(row)}>DETAIL</button><button onClick={() => onWatch(row)}>+ WATCH</button></td></tr>)}
+      {rows.map((row, index) => <tr key={`${row.symbol}-${index}`}><td data-label="#">{index + 1}</td><td data-label="SYMBOL"><button className="table-symbol" onClick={() => onSelect(row)}>{row.nse_symbol || row.symbol}</button></td><td data-label="COMPANY" className="company-cell">{row.name || "—"}</td><td data-label="LTP ₹">{number(row.ltp)}</td><td data-label="CHG %" className={Number(row.change_pct || 0) >= 0 ? "positive" : "negative"}>{Number(row.change_pct || 0) >= 0 ? "+" : ""}{number(row.change_pct)}%</td><td data-label="VOLUME">{compact(row.volume)}</td><td data-label="TURNOVER ₹">{compact(row.turnover)}</td><td data-label="RVOL">{number(row.relative_volume)}</td><td data-label="ACTIONS" className="row-actions"><button onClick={() => onDetails(row)}>DETAIL</button><button onClick={() => onWatch(row)}>+ WATCH</button></td></tr>)}
       {!rows.length && <tr><td colSpan={9} className="no-rows">NO ROWS MATCH THIS FILTER.</td></tr>}
     </tbody></table></div>
     <div className="screener-footer"><span>{rows.length} DISPLAYED / {payload.total} MATCHES</span><span>{meta.failed_batches ? `${meta.failed_batches} QUOTE BATCHES FAILED · ` : ""}{live ? "AUTO-REFRESH ON · 60S" : "AUTO-REFRESH PAUSED"}</span><span>SELECT SYMBOL TO OPEN CHART · DETAIL FOR QUOTE SNAPSHOT · ESC TO CLOSE</span></div>
