@@ -41,6 +41,11 @@ async def ticks_ws(websocket: WebSocket) -> None:
         origin = websocket.headers.get("origin", "").rstrip("/")
         expected_origin = settings.frontend_origin.rstrip("/")
         if not origin or origin != expected_origin:
+            logger.warning(
+                "websocket_rejected reason=origin_mismatch received_origin=%r expected_origin=%r",
+                origin,
+                expected_origin,
+            )
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         ticket = websocket.query_params.get("ticket", "")
@@ -48,12 +53,15 @@ async def ticks_ws(websocket: WebSocket) -> None:
             payload = jwt.decode(ticket, settings.terminal_ws_secret, algorithms=["HS256"])
             if payload.get("scope") != "market_ticks":
                 raise JWTError("wrong scope")
-        except JWTError:
+        except JWTError as exc:
+            # Log the validation class, never the ticket or signing secret.
+            logger.warning("websocket_rejected reason=invalid_ticket error=%s", type(exc).__name__)
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 
     client_ip = websocket.client.host if websocket.client else "unknown"
     if _connections_per_ip.get(client_ip, 0) >= MAX_CONNECTIONS_PER_IP:
+        logger.warning("websocket_rejected reason=connection_limit client_ip=%s", client_ip)
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
