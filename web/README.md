@@ -133,17 +133,24 @@ or variables prefixed with `NEXT_PUBLIC_`.
 ```dotenv
 APP_SECRET_KEY=<unique-random-secret>
 FINNHUB_API_KEY=<optional-provider-key>
-FRONTEND_ORIGIN=https://your-terminal.example.com
+FRONTEND_ORIGIN=https://smterminal-web.vercel.app
 ENVIRONMENT=production
 TERMINAL_BACKEND_TOKEN=<random-shared-backend-token>
 TERMINAL_WS_SECRET=<random-shared-websocket-secret>
 ```
 
+`FRONTEND_ORIGIN` must match the browser's address bar exactly (scheme and
+host, no path). Add additional production or preview origins as a
+comma-separated list only when you intentionally use them. The WebSocket
+checks this value before accepting a connection; leaving it at
+`http://localhost:3000` causes the exact `1008 origin_mismatch` failure shown
+in the browser console.
+
 **Next.js environment** (`web/.env.local` locally, or your web host's server
 secret store):
 
 ```dotenv
-MARKET_TERMINAL_API_BASE_URL=https://your-private-backend.example.com
+MARKET_TERMINAL_API_BASE_URL=https://your-backend.example.com
 MARKET_TERMINAL_WS_BASE_URL=wss://your-backend.example.com
 TERMINAL_ACCESS_PASSWORD=<long-unique-shared-website-password>
 TERMINAL_SESSION_SECRET=<independent-random-session-secret>
@@ -151,6 +158,8 @@ TERMINAL_BACKEND_TOKEN=<same-value-as-backend>
 TERMINAL_WS_SECRET=<same-value-as-backend>
 ```
 
+`MARKET_TERMINAL_API_BASE_URL` and `MARKET_TERMINAL_WS_BASE_URL` must point
+to the deployed backend; the second URL must be publicly reachable over WSS.
 `TERMINAL_BACKEND_TOKEN` and `TERMINAL_WS_SECRET` must match between the
 backend and Next.js server. The website server adds the private backend
 header and issues short-lived WebSocket tickets after verifying a signed,

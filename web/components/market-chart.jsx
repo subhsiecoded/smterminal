@@ -31,7 +31,9 @@ function formatVolume(value) {
 }
 
 function timeLabel(value, interval) {
-  const date = new Date(value);
+  const numeric = Number(value);
+  const normalized = Number.isFinite(numeric) && Math.abs(numeric) < 1e12 ? numeric * 1000 : value;
+  const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) return "—";
   if (["1m", "5m", "15m", "1h"].includes(interval)) {
     return date.toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
@@ -116,7 +118,8 @@ function drawChart(canvas, rows, options) {
   const volumeTop = priceBottom + volumeGap;
   const volumeBottom = height - bottom;
   const count = options.end - options.start;
-  const visible = rows.slice(options.start, options.end);
+  const visible = rows.slice(options.start, options.end).filter((row) => row && typeof row === "object");
+  if (!visible.length) return;
   const highs = visible.map((row) => asNumber(row.high, asNumber(row.close)));
   const lows = visible.map((row) => asNumber(row.low, asNumber(row.close)));
   const minRaw = Math.min(...lows);
@@ -193,6 +196,7 @@ function drawChart(canvas, rows, options) {
   } else {
     for (let index = options.start; index < options.end; index += 1) {
       const row = rows[index];
+      if (!row || typeof row !== "object") continue;
       const x = xFor(index);
       const open = asNumber(row.open, asNumber(row.close));
       const close = asNumber(row.close);
@@ -248,6 +252,7 @@ function drawChart(canvas, rows, options) {
   if (options.showVolume) {
     for (let index = options.start; index < options.end; index += 1) {
       const row = rows[index];
+      if (!row || typeof row !== "object") continue;
       const x = xFor(index);
       const volume = Math.max(0, asNumber(row.volume));
       const barHeight = (volume / maxVolume) * Math.max(8, volumeBottom - volumeTop - 13);
@@ -265,7 +270,8 @@ function drawChart(canvas, rows, options) {
   for (let index = 0; index < labels; index += 1) {
     const rowIndex = options.start + Math.round((index * (count - 1)) / Math.max(labels - 1, 1));
     const x = xFor(rowIndex);
-    ctx.fillText(timeLabel(rows[rowIndex].ts, options.interval), x, height - 3);
+    const row = rows[rowIndex];
+    if (row) ctx.fillText(timeLabel(row.ts, options.interval), x, height - 3);
   }
 
   // Crosshair and price guide.
@@ -303,6 +309,7 @@ export default function MarketChart({ candles = [], symbol, interval, loading = 
   const canvasRef = useRef(null);
   const stageRef = useRef(null);
   const dragRef = useRef(null);
+  const wheelHandlerRef = useRef(null);
   const [type, setType] = useState("candles");
   const [showVolume, setShowVolume] = useState(true);
   const [showSma, setShowSma] = useState(true);
@@ -311,7 +318,22 @@ export default function MarketChart({ candles = [], symbol, interval, loading = 
   const [hover, setHover] = useState(null);
   const [dragging, setDragging] = useState(false);
   const [view, setView] = useState({ bars: 90, offset: 0 });
-  const validCandles = useMemo(() => candles.filter((row) => row && Number.isFinite(Number(row.close)) && Number.isFinite(Number(row.open))), [candles]);
+  const validCandles = useMemo(() => {
+    if (!Array.isArray(candles)) return [];
+    const isFiniteValue = (value) => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
+    return candles.filter((row) =>
+      row && typeof row === "object" &&
+      isFiniteValue(row.open) && isFiniteValue(row.high) &&
+      isFiniteValue(row.low) && isFiniteValue(row.close)
+    ).map((row) => ({
+      ...row,
+      open: Number(row.open),
+      high: Number(row.high),
+      low: Number(row.low),
+      close: Number(row.close),
+      volume: isFiniteValue(row.volume) ? Number(row.volume) : 0,
+    }));
+  }, [candles]);
   const sma = useMemo(() => movingAverage(validCandles, 20), [validCandles]);
   const ema12 = useMemo(() => exponentialAverage(validCandles, 12), [validCandles]);
   const ema26 = useMemo(() => exponentialAverage(validCandles, 26), [validCandles]);
@@ -386,10 +408,11 @@ export default function MarketChart({ candles = [], symbol, interval, loading = 
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
     if (dragRef.current) {
-      const dx = event.clientX - dragRef.current.x;
+      const dragStart = dragRef.current;
+      const dx = event.clientX - dragStart.x;
       const plotWidth = Math.max(80, rect.width - 90);
       const barsMoved = Math.round((dx / plotWidth) * windowRange.bars);
-      setView((current) => ({ ...current, offset: Math.max(0, Math.min(validCandles.length - windowRange.bars, dragRef.current.offset + barsMoved)) }));
+      setView((current) => ({ ...current, offset: Math.max(0, Math.min(validCandles.length - windowRange.bars, dragStart.offset + barsMoved)) }));
     }
     const plotWidth = Math.max(80, rect.width - 90);
     const ratio = Math.max(0, Math.min(0.9999, (x - 14) / plotWidth));
@@ -397,20 +420,37 @@ export default function MarketChart({ candles = [], symbol, interval, loading = 
     setHover(index >= 0 && index < validCandles.length ? { index, x, y } : null);
   };
 
-  const handleWheel = (event) => {
+  const handleWheel = useCallback((event) => {
     if (!validCandles.length) return;
     event.preventDefault();
-    const rect = event.currentTarget.getBoundingClientRect();
+    const rect = stageRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const deltaY = event.deltaY;
     const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left - 14) / Math.max(80, rect.width - 90)));
     setView((current) => {
       const oldBars = Math.max(MIN_BARS, Math.min(validCandles.length, current.bars));
       const oldEnd = validCandles.length - current.offset;
       const anchor = Math.max(0, oldEnd - oldBars + ratio * oldBars);
-      const nextBars = Math.max(MIN_BARS, Math.min(Math.min(MAX_BARS, validCandles.length), Math.round(oldBars * (event.deltaY < 0 ? 0.82 : 1.22))));
+      const nextBars = Math.max(MIN_BARS, Math.min(Math.min(MAX_BARS, validCandles.length), Math.round(oldBars * (deltaY < 0 ? 0.82 : 1.22))));
       const nextStart = Math.max(0, Math.min(validCandles.length - nextBars, anchor - ratio * nextBars));
       return { bars: nextBars, offset: Math.max(0, validCandles.length - nextBars - nextStart) };
     });
-  };
+  }, [validCandles.length]);
+
+  useEffect(() => {
+    wheelHandlerRef.current = handleWheel;
+  }, [handleWheel]);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return undefined;
+    const onWheel = (event) => wheelHandlerRef.current?.(event);
+    // React's synthetic wheel listeners may be passive in modern browsers.
+    // A native non-passive listener is required when intentionally preventing
+    // page scroll to support chart zooming.
+    stage.addEventListener("wheel", onWheel, { passive: false });
+    return () => stage.removeEventListener("wheel", onWheel);
+  }, []);
 
   const hovered = hover && validCandles[hover.index] ? validCandles[hover.index] : null;
   const zoom = (factor) => setView((current) => ({ ...current, bars: Math.max(MIN_BARS, Math.min(Math.min(MAX_BARS, Math.max(validCandles.length, MIN_BARS)), Math.round(current.bars * factor))) }));
@@ -452,7 +492,6 @@ export default function MarketChart({ candles = [], symbol, interval, loading = 
         onPointerUp={() => { dragRef.current = null; setDragging(false); }}
         onPointerCancel={() => { dragRef.current = null; setDragging(false); }}
         onPointerLeave={() => { if (!dragRef.current) setHover(null); }}
-        onWheel={handleWheel}
         onDoubleClick={fit}
         role="img"
         aria-label={`${symbol} interactive ${type} chart. Drag to pan, scroll to zoom, double-click to fit.`}

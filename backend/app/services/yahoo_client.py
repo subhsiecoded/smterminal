@@ -13,6 +13,7 @@ needs to change.
 import logging
 import time
 import asyncio
+import math
 
 import httpx
 
@@ -264,6 +265,59 @@ async def get_movers(category: str, count: int = 10) -> list[dict]:
     return out
 
 
+def _parse_candles_payload(data: dict) -> list[dict]:
+    """Normalize Yahoo chart data and safely discard incomplete OHLC bars."""
+    if not isinstance(data, dict):
+        return []
+    chart_root = data.get("chart")
+    if not isinstance(chart_root, dict):
+        return []
+    results = chart_root.get("result")
+    if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+        return []
+
+    chart = results[0]
+    timestamps = chart.get("timestamp")
+    indicators = chart.get("indicators")
+    quote_sections = indicators.get("quote") if isinstance(indicators, dict) else None
+    quote = quote_sections[0] if isinstance(quote_sections, list) and quote_sections and isinstance(quote_sections[0], dict) else {}
+    if not isinstance(timestamps, list):
+        return []
+
+    fields = {name: quote.get(name) if isinstance(quote.get(name), list) else []
+              for name in ("open", "high", "low", "close", "volume")}
+
+    def finite_number(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    candles = []
+    for index, timestamp in enumerate(timestamps):
+        values = [finite_number(fields[name][index]) if index < len(fields[name]) else None
+                  for name in ("open", "high", "low", "close")]
+        if any(value is None for value in values):
+            continue  # Yahoo pads gaps (halts, pre-market) with nulls.
+        try:
+            ts = int(timestamp)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        volume = finite_number(fields["volume"][index]) if index < len(fields["volume"]) else 0
+        candles.append({
+            "ts": ts,
+            "open": values[0],
+            "high": values[1],
+            "low": values[2],
+            "close": values[3],
+            "volume": max(0, int(volume or 0)),
+        })
+    return candles
+
+
 async def get_candles(symbol: str, interval: str) -> list[dict]:
     yahoo_interval, yahoo_range = _INTERVAL_MAP.get(interval, ("1d", "1y"))
     async with httpx.AsyncClient(headers=_BASE_HEADERS, timeout=8.0) as client:
@@ -273,24 +327,4 @@ async def get_candles(symbol: str, interval: str) -> list[dict]:
         )
         resp.raise_for_status()
         data = resp.json()
-
-    result = data.get("chart", {}).get("result")
-    if not result:
-        return []
-    chart = result[0]
-    timestamps = chart.get("timestamp", [])
-    quote = chart.get("indicators", {}).get("quote", [{}])[0]
-
-    candles = []
-    for i, ts in enumerate(timestamps):
-        o, h, l, c, v = (
-            quote.get("open", [None])[i] if i < len(quote.get("open", [])) else None,
-            quote.get("high", [None])[i] if i < len(quote.get("high", [])) else None,
-            quote.get("low", [None])[i] if i < len(quote.get("low", [])) else None,
-            quote.get("close", [None])[i] if i < len(quote.get("close", [])) else None,
-            quote.get("volume", [None])[i] if i < len(quote.get("volume", [])) else None,
-        )
-        if None in (o, h, l, c):
-            continue  # Yahoo pads gaps (halts, pre-market) with nulls
-        candles.append({"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": v or 0})
-    return candles
+    return _parse_candles_payload(data)

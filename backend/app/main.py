@@ -9,7 +9,7 @@ import httpx
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
-from app.config import get_settings
+from app.config import get_settings, parse_frontend_origins
 from app.rate_limit import limiter
 from app.routers import instruments, market, orders, trading_mode, watchlists
 from app.security import RequestContextMiddleware, SecurityHeadersMiddleware, logger
@@ -18,6 +18,7 @@ from app.services.watch_registry import registry
 from app.ws.gateway import router as ws_router
 
 settings = get_settings()
+frontend_origins = parse_frontend_origins(settings.frontend_origin)
 if settings.environment.lower() == "production":
     def is_strong_secret(value: str | None) -> bool:
         return bool(
@@ -37,8 +38,8 @@ if settings.environment.lower() == "production":
     # fails every WebSocket upgrade in production (the gateway's origin
     # check never matches), silently and with no server-side signal until
     # now - so it gets the same fail-fast treatment as the secrets above.
-    if settings.frontend_origin.rstrip("/") in ("", "http://localhost:3000"):
-        missing_security.append("FRONTEND_ORIGIN (still set to its local-dev default)")
+    if not frontend_origins or any(origin.startswith("http://") or "localhost" in origin for origin in frontend_origins):
+        missing_security.append("FRONTEND_ORIGIN (set exact production HTTPS origin(s), comma-separated)")
     if missing_security:
         raise RuntimeError(
             "Production web deployment requires " + ", ".join(missing_security)
@@ -110,7 +111,7 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestContextMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_origin],
+    allow_origins=frontend_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Live-Intent-Token"],

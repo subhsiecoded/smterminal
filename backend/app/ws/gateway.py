@@ -6,7 +6,7 @@ import time
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from jose import JWTError, jwt
 
-from app.config import get_settings
+from app.config import get_settings, parse_frontend_origins
 
 from app.services.pubsub import broker
 from app.services.watch_registry import registry
@@ -63,12 +63,10 @@ async def ticks_ws(websocket: WebSocket) -> None:
             # FRONTEND_ORIGIN may list several allowed origins, comma-separated
             # (e.g. a production domain plus Vercel preview URLs) - matched
             # exactly (scheme + host + port), trailing slash ignored.
-            allowed_origins = {
-                candidate.strip().rstrip("/")
-                for candidate in settings.frontend_origin.split(",")
-                if candidate.strip()
-            }
-            origin = websocket.headers.get("origin", "").rstrip("/")
+            allowed_origins = set(parse_frontend_origins(settings.frontend_origin))
+            origin_header = websocket.headers.get("origin", "")
+            normalized_origin = parse_frontend_origins(origin_header)
+            origin = normalized_origin[0] if normalized_origin else ""
             if not origin or origin not in allowed_origins:
                 await reject(f"origin_mismatch got={origin or '(none)'} allowed={sorted(allowed_origins)}")
                 return
@@ -118,13 +116,25 @@ async def ticks_ws(websocket: WebSocket) -> None:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            for raw_sym in msg.get("subscribe", []):
+            if not isinstance(msg, dict):
+                continue
+            subscribe = msg.get("subscribe", [])
+            unsubscribe = msg.get("unsubscribe", [])
+            if not isinstance(subscribe, list):
+                subscribe = []
+            if not isinstance(unsubscribe, list):
+                unsubscribe = []
+            for raw_sym in subscribe:
+                if not isinstance(raw_sym, str):
+                    continue
                 sym = normalize_symbol(raw_sym)
                 if sym and sym not in subscribed and len(subscribed) < MAX_SYMBOLS_PER_CONNECTION:
                     broker.subscribe(f"ticks:{sym}", queue)
                     subscribed.add(sym)
                     registry.add_ws_interest(sym)
-            for raw_sym in msg.get("unsubscribe", []):
+            for raw_sym in unsubscribe:
+                if not isinstance(raw_sym, str):
+                    continue
                 sym = normalize_symbol(raw_sym)
                 if sym and sym in subscribed:
                     broker.unsubscribe(f"ticks:{sym}", queue)
@@ -137,12 +147,25 @@ async def ticks_ws(websocket: WebSocket) -> None:
         asyncio.create_task(handle_client_messages()),
     ]
     try:
-        await asyncio.gather(*tasks)
+        # Stop the connection as soon as either the client disconnects or a
+        # sender/heartbeat task fails. A bare gather() can leave sibling tasks
+        # running after a send failure and generate noisy unhandled errors.
+        done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            try:
+                task.result()
+            except WebSocketDisconnect:
+                pass
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - isolate socket teardown
+                logger.debug("ws_task_ended client_ip=%s error=%s", client_ip, type(exc).__name__)
     except WebSocketDisconnect:
         pass
     finally:
         for task in tasks:
             task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         for sym in subscribed:
             registry.remove_ws_interest(sym)
         broker.unsubscribe_all(queue, {f"ticks:{s}" for s in subscribed})

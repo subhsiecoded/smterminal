@@ -28,10 +28,10 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--green); out
 .status-dot { width: 7px; height: 7px; display: inline-block; border-radius: 50%; background: #888; box-shadow: 0 0 7px currentColor; }
 .status-dot.live { background: var(--green); color: var(--green); }
 .status-dot.connecting, .status-dot.reconnecting { background: var(--amber); color: var(--amber); }
-.status-dot.stale, .status-dot.closed { background: var(--red); color: var(--red); }
+.status-dot.stale, .status-dot.closed, .status-dot.error { background: var(--red); color: var(--red); }
 .status-label { letter-spacing: .08em; font-weight: 700; font-size: 10px; }
 .status-label.connecting, .status-label.reconnecting { color: var(--amber); }
-.status-label.stale, .status-label.closed { color: var(--red); }
+.status-label.stale, .status-label.closed, .status-label.error { color: var(--red); }
 .header-clock { color: var(--green-dim); margin-left: 12px; font-size: 11px; }
 .logout-button { border: 1px solid var(--green-line); background: transparent; color: var(--green-dim); padding: 5px 8px; font-size: 9px; margin-left: 12px; cursor: pointer; }
 .logout-button:hover { border-color: var(--green); color: var(--green); }

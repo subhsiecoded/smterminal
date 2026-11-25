@@ -25,11 +25,21 @@ export async function GET(request, context) {
     const backend = process.env.MARKET_TERMINAL_API_BASE_URL;
     if (!backend)
         return NextResponse.json({ detail: "MARKET_TERMINAL_API_BASE_URL is not configured." }, { status: 503 });
+    let backendUrl;
+    try {
+        backendUrl = new URL(backend);
+    }
+    catch {
+        return NextResponse.json({ detail: "MARKET_TERMINAL_API_BASE_URL must be a valid backend URL." }, { status: 503 });
+    }
+    if (!backendUrl.hostname || backendUrl.username || backendUrl.password || (process.env.NODE_ENV === "production" && backendUrl.protocol !== "https:")) {
+        return NextResponse.json({ detail: "Production market-data API must use a valid HTTPS backend origin." }, { status: 503 });
+    }
     const backendToken = process.env.TERMINAL_BACKEND_TOKEN || "";
-    if (process.env.NODE_ENV === "production" && (backendToken.length < 32 || /^(replace-with-|change-this-)/i.test(backendToken))) {
+    if (process.env.NODE_ENV === "production" && (backendToken.length < 32 || /^(replace-with-|change-this-|dev-only-)/i.test(backendToken))) {
         return NextResponse.json({ detail: "A unique TERMINAL_BACKEND_TOKEN of at least 32 characters is required in production." }, { status: 503 });
     }
-    const target = new URL(`/api/${path.map(encodeURIComponent).join("/")}`, backend);
+    const target = new URL(`/api/${path.map(encodeURIComponent).join("/")}`, backendUrl.origin);
     request.nextUrl.searchParams.forEach((value, key) => target.searchParams.append(key, value));
     try {
         const upstream = await fetch(target, {

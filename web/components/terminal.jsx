@@ -95,6 +95,12 @@ function parseCommand(raw) {
 function formatUtcTime(date) {
     return `${date.toISOString().slice(0, 19).replace("T", " ")} UTC`;
 }
+function formatMarketDate(value) {
+    if (value === null || value === undefined || value === "") return "—";
+    const numeric = Number(value);
+    const date = new Date(Number.isFinite(numeric) && Math.abs(numeric) < 1e12 ? numeric * 1000 : value);
+    return Number.isNaN(date.getTime()) ? "—" : date.toLocaleDateString();
+}
 export default function Terminal() {
     const [watchlist, setWatchlist] = useState(DEFAULT_SYMBOLS);
     const [selected, setSelected] = useState("RELIANCE.NS");
@@ -127,8 +133,15 @@ export default function Terminal() {
     const mounted = useRef(false);
     const manualDisconnect = useRef(false);
     const selectedQuote = quotes[selected];
-    const chart = useMemo(() => renderChart(candles.map((row) => row.close), chartWidth, 15), [candles, chartWidth]);
-    const chartLast = candles.length ? candles[candles.length - 1].close : selectedQuote?.ltp;
+    const safeCandles = useMemo(
+        () => Array.isArray(candles)
+            ? candles.filter((row) => row && typeof row === "object" && row.close !== null && row.close !== undefined && Number.isFinite(Number(row.close)))
+                .map((row) => ({ ...row, close: Number(row.close) }))
+            : [],
+        [candles]
+    );
+    const chart = useMemo(() => renderChart(safeCandles.map((row) => row.close), chartWidth, 15), [safeCandles, chartWidth]);
+    const chartLast = safeCandles.at(-1)?.close ?? selectedQuote?.ltp;
     const visibleScreenerRows = useMemo(() => {
         const rows = screener?.results || [];
         const query = screenerFilter.trim().toLowerCase();
@@ -187,10 +200,13 @@ export default function Terminal() {
             return;
         try {
             const payload = await api(`market/quotes?symbols=${encodeURIComponent(symbols.join(","))}`);
+            if (!Array.isArray(payload)) throw new Error("The market API returned an invalid quotes payload");
             setQuotes((current) => {
                 const next = { ...current };
-                for (const quote of payload)
+                for (const quote of payload) {
+                    if (!quote || typeof quote.symbol !== "string") continue;
                     next[quote.symbol] = { ...next[quote.symbol], ...quote };
+                }
                 return next;
             });
         }
@@ -205,8 +221,9 @@ export default function Terminal() {
                 api(`market/candles/${encodeURIComponent(selected)}?interval=${interval}`),
                 api(`market/indicators/${encodeURIComponent(selected)}?interval=${interval}`)
             ]);
-            setCandles(history);
-            setIndicators(technicals);
+            if (!Array.isArray(history)) throw new Error("The market API returned an invalid candle payload");
+            setCandles(history.filter((row) => row && typeof row === "object"));
+            setIndicators(technicals && typeof technicals === "object" ? technicals : {});
             setFeedback(`chart refreshed · ${selected} · ${interval}`);
         }
         catch (error) {
@@ -232,94 +249,155 @@ export default function Terminal() {
         let cancelled = false;
         manualDisconnect.current = false;
         let socket = null;
-        let retryTimer;
-        let heartbeatTimer;
+        let retryTimer = null;
+        let heartbeatTimer = null;
         let backoff = 1000;
         let lastHeartbeat = Date.now();
+
+        const clearHeartbeat = () => {
+            if (heartbeatTimer !== null) {
+                window.clearInterval(heartbeatTimer);
+                heartbeatTimer = null;
+            }
+        };
+
+        const scheduleReconnect = () => {
+            if (cancelled || manualDisconnect.current || retryTimer !== null) return;
+            setStatus("reconnecting");
+            retryTimer = window.setTimeout(() => {
+                retryTimer = null;
+                backoff = Math.min(backoff * 2, 15000);
+                void connect();
+            }, backoff);
+        };
+
         const connect = async () => {
-            if (cancelled)
-                return;
+            if (cancelled || manualDisconnect.current) return;
             setStatus(backoff > 1000 ? "reconnecting" : "connecting");
             try {
                 const response = await fetch("/api/ws-ticket", { cache: "no-store" });
-                if (!response.ok)
-                    throw new Error("Could not obtain live-stream ticket");
-                const config = await response.json();
-                if (cancelled)
+                const config = await response.json().catch(() => ({}));
+                if (cancelled) return;
+
+                if (response.status === 401) {
+                    window.location.assign("/login");
                     return;
-                const url = new URL(`${config.wsBaseUrl.replace(/\/$/, "")}/ws/ticks`);
-                if (config.ticket)
+                }
+                if (!response.ok) {
+                    const message = typeof config.detail === "string" ? config.detail : `Live-stream setup failed (${response.status})`;
+                    setStatus("error");
+                    setFeedback(`[live stream] ${message}`);
+                    // A 503 from this route means deployment configuration is
+                    // incomplete; retrying cannot repair a missing server secret or URL.
+                    if (response.status !== 503) scheduleReconnect();
+                    return;
+                }
+
+                if (typeof config.wsBaseUrl !== "string" || !config.wsBaseUrl.trim()) {
+                    setStatus("error");
+                    setFeedback("[live stream] backend WSS URL is missing; configure MARKET_TERMINAL_WS_BASE_URL on the web deployment");
+                    return;
+                }
+
+                let baseUrl;
+                try {
+                    baseUrl = new URL(config.wsBaseUrl);
+                } catch {
+                    setStatus("error");
+                    setFeedback("[live stream] MARKET_TERMINAL_WS_BASE_URL is not a valid WebSocket URL");
+                    return;
+                }
+                const securePage = window.location.protocol === "https:";
+                if (!(["ws:", "wss:"].includes(baseUrl.protocol)) || (securePage && baseUrl.protocol !== "wss:")) {
+                    setStatus("error");
+                    setFeedback("[live stream] an HTTPS website requires a valid WSS backend URL");
+                    return;
+                }
+
+                const url = new URL(`${baseUrl.origin}/ws/ticks`);
+                if (typeof config.ticket === "string" && config.ticket) {
                     url.searchParams.set("ticket", config.ticket);
-                socket = new WebSocket(url.toString());
-                wsRef.current = socket;
-                socket.onopen = () => {
-                    if (cancelled)
-                        return socket?.close();
+                }
+
+                const candidate = new WebSocket(url.toString());
+                socket = candidate;
+                wsRef.current = candidate;
+                candidate.onopen = () => {
+                    if (cancelled || wsRef.current !== candidate) {
+                        candidate.close();
+                        return;
+                    }
                     backoff = 1000;
                     lastHeartbeat = Date.now();
                     setStatus("live");
-                    socket?.send(JSON.stringify({ subscribe: wantedSymbols.current }));
+                    try {
+                        candidate.send(JSON.stringify({ subscribe: wantedSymbols.current }));
+                    } catch {
+                        candidate.close();
+                    }
                 };
-                socket.onmessage = (event) => {
+                candidate.onmessage = (event) => {
+                    if (cancelled || wsRef.current !== candidate) return;
                     try {
                         const message = JSON.parse(String(event.data));
                         if (message.type === "heartbeat") {
                             lastHeartbeat = Date.now();
                             return;
                         }
-                        if (message.symbol) {
+                        if (typeof message.symbol === "string") {
                             setQuotes((current) => ({
                                 ...current,
                                 [message.symbol]: { ...current[message.symbol], ...message }
                             }));
                         }
-                    }
-                    catch {
-                        // Ignore malformed provider messages without dropping the connection.
+                    } catch {
+                        // Ignore malformed provider frames; a bad tick must not crash the UI.
                     }
                 };
-                socket.onerror = () => setStatus("reconnecting");
-                socket.onclose = (event) => {
-                    // The backend now always completes the handshake and closes
-                    // with a real code + reason (see backend/app/ws/gateway.py),
-                    // so a rejection is visible here instead of a bare failure.
+                candidate.onerror = () => {
+                    if (!cancelled && wsRef.current === candidate) setStatus("reconnecting");
+                };
+                candidate.onclose = (event) => {
+                    clearHeartbeat();
+                    if (wsRef.current === candidate) wsRef.current = null;
+                    if (cancelled || manualDisconnect.current) return;
+
+                    // Policy/protocol closes are configuration or request errors,
+                    // not transient network failures. Stop here to prevent an
+                    // infinite reconnect loop and surface the backend's reason.
+                    if ([1002, 1003, 1007, 1008].includes(event.code)) {
+                        setStatus("error");
+                        setFeedback(`[live stream] rejected (${event.code}) ${event.reason || "Check FRONTEND_ORIGIN and matching TERMINAL_WS_SECRET values on both deployments."}`);
+                        return;
+                    }
+
                     if (event.code !== 1000 && event.reason) {
                         console.warn(`[live stream] closed: ${event.code} ${event.reason}`);
                     }
-                    if (heartbeatTimer)
-                        window.clearInterval(heartbeatTimer);
-                    if (cancelled || manualDisconnect.current)
-                        return;
-                    setStatus("reconnecting");
-                    retryTimer = window.setTimeout(() => {
-                        backoff = Math.min(backoff * 2, 15000);
-                        void connect();
-                    }, backoff);
+                    scheduleReconnect();
                 };
+
+                clearHeartbeat();
                 heartbeatTimer = window.setInterval(() => {
-                    if (socket?.readyState === WebSocket.OPEN && Date.now() - lastHeartbeat > 30000)
-                        socket.close();
+                    if (wsRef.current === candidate && candidate.readyState === WebSocket.OPEN) {
+                        if (Date.now() - lastHeartbeat > 30000) candidate.close();
+                    }
                 }, 5000);
-            }
-            catch {
-                if (!cancelled) {
-                    setStatus("reconnecting");
-                    retryTimer = window.setTimeout(() => {
-                        backoff = Math.min(backoff * 2, 15000);
-                        void connect();
-                    }, backoff);
-                }
+            } catch (error) {
+                if (cancelled || manualDisconnect.current) return;
+                setStatus("reconnecting");
+                if (error instanceof Error) setFeedback(`[live stream] ${error.message}`);
+                scheduleReconnect();
             }
         };
+
         void connect();
         return () => {
             cancelled = true;
-            if (retryTimer)
-                window.clearTimeout(retryTimer);
-            if (heartbeatTimer)
-                window.clearInterval(heartbeatTimer);
-            socket?.close();
-            wsRef.current = null;
+            if (retryTimer !== null) window.clearTimeout(retryTimer);
+            clearHeartbeat();
+            socket?.close(1000, "component unmounted");
+            if (wsRef.current === socket) wsRef.current = null;
         };
     }, []);
     useEffect(() => {
@@ -366,12 +444,17 @@ export default function Terminal() {
         setWatchlist((current) => [...current, ...added]);
         setFeedback(`watching: ${added.join(", ")}`);
         void api(`market/quotes?symbols=${encodeURIComponent([...added, selected].join(","))}`)
-            .then((payload) => setQuotes((current) => {
-            const next = { ...current };
-            for (const quote of payload)
-                next[quote.symbol] = { ...next[quote.symbol], ...quote };
-            return next;
-        }))
+            .then((payload) => {
+                if (!Array.isArray(payload)) throw new Error("The market API returned an invalid quotes payload");
+                setQuotes((current) => {
+                    const next = { ...current };
+                    for (const quote of payload) {
+                        if (!quote || typeof quote.symbol !== "string") continue;
+                        next[quote.symbol] = { ...next[quote.symbol], ...quote };
+                    }
+                    return next;
+                });
+            })
             .catch((error) => setFeedback(`[watchlist] ${error instanceof Error ? error.message : "Unable to seed added symbols"}`));
     }
     function removeWatchlist(rawSymbols) {
@@ -612,14 +695,14 @@ export default function Terminal() {
           </div>
           <div className="chart-viewport" ref={chartViewport}>
             <MarketChart
-              candles={candles}
+              candles={safeCandles}
               symbol={selected}
               interval={interval}
               loading={busy}
               livePrice={selectedQuote?.ltp}
             />
           </div>
-          <div className="chart-axis"><span>{candles[0]?.ts ? new Date(candles[0].ts).toLocaleDateString() : "—"}</span><span>{candles.length ? `${candles.length} BARS · ${interval.toUpperCase()}` : "WAITING FOR DATA"}</span><span>{candles[candles.length - 1]?.ts ? new Date(candles[candles.length - 1].ts).toLocaleDateString() : "—"}</span></div>
+          <div className="chart-axis"><span>{formatMarketDate(safeCandles[0]?.ts)}</span><span>{safeCandles.length ? `${safeCandles.length} BARS · ${interval.toUpperCase()}` : "WAITING FOR DATA"}</span><span>{formatMarketDate(safeCandles.at(-1)?.ts)}</span></div>
           <div className="indicator-row">
             <span>SMA20 <b>{number(indicators.sma20)}</b></span><span>EMA12 <b>{number(indicators.ema12)}</b></span><span>EMA26 <b>{number(indicators.ema26)}</b></span><span>RSI14 <b>{number(indicators.rsi14)}</b></span>
           </div>
