@@ -129,19 +129,6 @@ app.include_router(trading_mode.router)
 app.include_router(ws_router)
 
 
-@app.get("/api/health/websocket")
-async def websocket_health() -> dict:
-    """Safe deployment diagnostics; never returns signing keys or tickets."""
-    return {
-        "status": "ok",
-        "ticket_required": bool(settings.terminal_ws_secret),
-        "origin_check_enabled": bool(settings.terminal_ws_secret),
-        "expected_origin": settings.frontend_origin.rstrip("/"),
-        "websocket_route": "/ws/ticks",
-        "runtime": "fastapi-asgi",
-    }
-
-
 @app.get("/api/health")
 async def health() -> dict:
     # No external services to check anymore - the only way this process

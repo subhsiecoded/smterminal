@@ -6,7 +6,7 @@ function isAllowed(parts) {
     if (parts.some((part) => !part || part === "." || part === ".." || part.includes("\\")))
         return false;
     const path = parts.join("/");
-    if (path === "health" || path === "health/providers" || path === "health/websocket")
+    if (path === "health" || path === "health/providers")
         return true;
     if (path === "market/quotes" || path === "market/movers" || path === "market/india/screener")
         return true;

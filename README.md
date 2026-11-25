@@ -321,8 +321,3 @@ GET /api/market/india/screener?category=turnover&sort_by=turnover&order=desc
 ```
 
 The terminal adds the `india-movers` / `screener` command and a full-screen cursor-driven results table. `movers gainers|losers|active` remains unchanged. The screener is best-effort because Yahoo's quote endpoint is unofficial; it is not an exchange-certified real-time feed.
-
-
-## Vercel deployment notes
-
-See [`DEPLOYMENT-VERCEL.md`](DEPLOYMENT-VERCEL.md) for the exact backend and web project settings, environment variables, WebSocket diagnostics, and the interactive chart controls.

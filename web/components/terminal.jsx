@@ -1,11 +1,70 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import MarketChart from "@/components/market-chart";
 const DEFAULT_SYMBOLS = ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "^NSEI", "^NSEBANK", "BTC-USD", "AAPL"];
 const INTERVALS = ["1m", "5m", "15m", "1h", "1d", "1w"];
 const CATEGORIES = ["gainers", "losers", "active", "turnover", "unusual-volume", "all"];
 const RESERVED = new Set(["INDIA-MOVERS", "INDIA", "SCREENER", "NSE", "MOVERS", "GAINERS", "LOSERS", "ACTIVE", "TURNOVER", "UNUSUAL-VOLUME"]);
 const SYMBOL_RE = /^[A-Z0-9^][A-Z0-9.^=_-]{0,31}$/;
+const BLOCKS = " ▁▂▃▄▅▆▇█";
+async function api(path, init) {
+    const response = await fetch(`/api/backend/${path.replace(/^\//, "")}`, {
+        ...init,
+        cache: "no-store",
+        headers: { ...(init?.headers || {}) }
+    });
+    let payload;
+    try {
+        payload = await response.json();
+    }
+    catch {
+        payload = null;
+    }
+    if (!response.ok) {
+        const detail = payload && typeof payload === "object" && "detail" in payload
+            ? String(payload.detail)
+            : `Request failed (${response.status})`;
+        throw new Error(detail);
+    }
+    return payload;
+}
+function cleanSymbols(values) {
+    const cleaned = [];
+    for (const value of values) {
+        const symbol = value.trim().toUpperCase();
+        if (symbol && !RESERVED.has(symbol) && SYMBOL_RE.test(symbol) && !cleaned.includes(symbol))
+            cleaned.push(symbol);
+    }
+    return cleaned;
+}
+function resample(values, width) {
+    if (!values.length)
+        return Array(width).fill(0);
+    if (width <= 1)
+        return [values[values.length - 1]];
+    if (values.length >= width) {
+        return Array.from({ length: width }, (_, i) => values[Math.round(i * (values.length - 1) / (width - 1))]);
+    }
+    return Array.from({ length: width }, (_, i) => values[Math.min(Math.floor(i * values.length / width), values.length - 1)]);
+}
+function renderChart(prices, width, height) {
+    if (!prices.length)
+        return { lines: [], directions: [], lo: 0, hi: 0 };
+    const sampled = resample(prices, width);
+    if (!sampled.length)
+        return { lines: [], directions: [], lo: 0, hi: 0 };
+    const lo = Math.min(...sampled);
+    const hi = Math.max(...sampled);
+    const range = (hi - lo) || 1;
+    const levels = sampled.map((price) => Math.min(Math.max(Math.round((price - lo) / range * height * 8), 0), height * 8));
+    const lines = [];
+    for (let row = 0; row < height; row += 1) {
+        const fromBottom = height - 1 - row;
+        const base = fromBottom * 8;
+        lines.push(levels.map((level) => BLOCKS[Math.min(Math.max(level - base, 0), 8)]));
+    }
+    const directions = sampled.map((price, index) => index === 0 || price >= sampled[index - 1]);
+    return { lines, directions, lo, hi };
+}
 function number(value, decimals = 2, fallback = "—") {
     if (value === null || value === undefined || value === "")
         return fallback;
@@ -59,16 +118,15 @@ export default function Terminal() {
     const [detailRow, setDetailRow] = useState(null);
     const [showHelp, setShowHelp] = useState(false);
     const commandInput = useRef(null);
+    const chartViewport = useRef(null);
+    const [chartWidth, setChartWidth] = useState(96);
     const wsRef = useRef(null);
     const wantedSymbols = useRef([...DEFAULT_SYMBOLS]);
     const previousSymbols = useRef([...DEFAULT_SYMBOLS]);
     const mounted = useRef(false);
     const manualDisconnect = useRef(false);
     const selectedQuote = quotes[selected];
-    const chart = useMemo(() => ({
-        hi: candles.length ? Math.max(...candles.map((row) => Number(row.high ?? row.close))) : 0,
-        lo: candles.length ? Math.min(...candles.map((row) => Number(row.low ?? row.close))) : 0,
-    }), [candles]);
+    const chart = useMemo(() => renderChart(candles.map((row) => row.close), chartWidth, 15), [candles, chartWidth]);
     const chartLast = candles.length ? candles[candles.length - 1].close : selectedQuote?.ltp;
     const visibleScreenerRows = useMemo(() => {
         const rows = screener?.results || [];
@@ -110,6 +168,17 @@ export default function Terminal() {
         setClock(new Date());
         const id = window.setInterval(() => setClock(new Date()), 1000);
         return () => window.clearInterval(id);
+    }, []);
+    useEffect(() => {
+        const element = chartViewport.current;
+        if (!element)
+            return;
+        const observer = new ResizeObserver((entries) => {
+            const width = entries[0]?.contentRect.width || element.clientWidth;
+            setChartWidth(Math.max(36, Math.min(180, Math.floor(width / 8.7))));
+        });
+        observer.observe(element);
+        return () => observer.disconnect();
     }, []);
     const refreshQuotes = useCallback(async () => {
         const symbols = cleanSymbols([...watchlist, selected]);
@@ -160,98 +229,36 @@ export default function Terminal() {
     }, [refreshChart]);
     useEffect(() => {
         let cancelled = false;
+        manualDisconnect.current = false;
         let socket = null;
-        let retryTimer = null;
-        let heartbeatTimer = null;
-        let fallbackTimer = null;
+        let retryTimer;
+        let heartbeatTimer;
         let backoff = 1000;
         let lastHeartbeat = Date.now();
-        let diagnosticShown = false;
-        manualDisconnect.current = false;
-
-        const pollQuotes = async () => {
-            const symbols = cleanSymbols(wantedSymbols.current);
-            if (!symbols.length || cancelled) return;
-            try {
-                const payload = await api(`market/quotes?symbols=${encodeURIComponent(symbols.join(","))}`);
-                if (cancelled) return;
-                setQuotes((current) => {
-                    const next = { ...current };
-                    for (const quote of payload) next[quote.symbol] = { ...next[quote.symbol], ...quote };
-                    return next;
-                });
-            } catch (error) {
-                if (!cancelled && !diagnosticShown) {
-                    setFeedback(`[feed] live socket unavailable · polling fallback active · ${error instanceof Error ? error.message : "quote refresh failed"}`);
-                }
-            }
-        };
-
-        const startPollingFallback = () => {
-            if (cancelled || fallbackTimer) return;
-            setStatus("polling");
-            void pollQuotes();
-            fallbackTimer = window.setInterval(() => void pollQuotes(), 5000);
-            if (!diagnosticShown) {
-                diagnosticShown = true;
-                void api("health/websocket").then((diagnostic) => {
-                    if (cancelled) return;
-                    const expected = String(diagnostic.expected_origin || "").replace(/\/$/, "");
-                    if (expected && expected !== window.location.origin) {
-                        setFeedback(`[ws] origin mismatch · set backend FRONTEND_ORIGIN=${window.location.origin}`);
-                    } else if (diagnostic.ticket_required && diagnostic.websocket_route !== "/ws/ticks") {
-                        setFeedback("[ws] backend WebSocket route configuration needs review");
-                    } else {
-                        setFeedback("[ws] connection rejected · checking backend Vercel function logs; 5s market polling is active meanwhile");
-                    }
-                }).catch(() => {
-                    if (!cancelled) setFeedback("[ws] diagnostics unavailable · 5s market polling is active meanwhile");
-                });
-            }
-        };
-
-        const stopPollingFallback = () => {
-            if (fallbackTimer) window.clearInterval(fallbackTimer);
-            fallbackTimer = null;
-        };
-
-        const scheduleReconnect = () => {
-            if (cancelled || manualDisconnect.current || retryTimer) return;
-            const delay = Math.round(backoff * (0.85 + Math.random() * 0.3));
-            retryTimer = window.setTimeout(() => {
-                retryTimer = null;
-                backoff = Math.min(backoff * 2, 15000);
-                void connect();
-            }, delay);
-        };
-
         const connect = async () => {
-            if (cancelled || manualDisconnect.current) return;
-            setStatus(fallbackTimer ? "polling" : (backoff > 1000 ? "reconnecting" : "connecting"));
+            if (cancelled)
+                return;
+            setStatus(backoff > 1000 ? "reconnecting" : "connecting");
             try {
-                const response = await fetch("/api/ws-ticket", { cache: "no-store", credentials: "same-origin" });
-                if (!response.ok) {
-                    const body = await response.json().catch(() => null);
-                    throw new Error(body?.detail || `ticket request failed (${response.status})`);
-                }
+                const response = await fetch("/api/ws-ticket", { cache: "no-store" });
+                if (!response.ok)
+                    throw new Error("Could not obtain live-stream ticket");
                 const config = await response.json();
-                if (cancelled) return;
-                if (!config.wsBaseUrl) throw new Error("WebSocket base URL is not configured");
+                if (cancelled)
+                    return;
                 const url = new URL(`${config.wsBaseUrl.replace(/\/$/, "")}/ws/ticks`);
-                if (config.ticket) url.searchParams.set("ticket", config.ticket);
+                if (config.ticket)
+                    url.searchParams.set("ticket", config.ticket);
                 socket = new WebSocket(url.toString());
                 wsRef.current = socket;
-
                 socket.onopen = () => {
-                    if (cancelled) return socket?.close();
+                    if (cancelled)
+                        return socket?.close();
                     backoff = 1000;
                     lastHeartbeat = Date.now();
-                    stopPollingFallback();
                     setStatus("live");
                     socket?.send(JSON.stringify({ subscribe: wantedSymbols.current }));
-                    void pollQuotes();
                 };
-
                 socket.onmessage = (event) => {
                     try {
                         const message = JSON.parse(String(event.data));
@@ -265,51 +272,46 @@ export default function Terminal() {
                                 [message.symbol]: { ...current[message.symbol], ...message }
                             }));
                         }
-                    } catch {
+                    }
+                    catch {
                         // Ignore malformed provider messages without dropping the connection.
                     }
                 };
-
-                socket.onerror = () => {
-                    if (!cancelled) {
-                        startPollingFallback();
-                        try { socket?.close(); } catch { /* The browser may already have closed it. */ }
-                    }
+                socket.onerror = () => setStatus("reconnecting");
+                socket.onclose = () => {
+                    if (heartbeatTimer)
+                        window.clearInterval(heartbeatTimer);
+                    if (cancelled || manualDisconnect.current)
+                        return;
+                    setStatus("reconnecting");
+                    retryTimer = window.setTimeout(() => {
+                        backoff = Math.min(backoff * 2, 15000);
+                        void connect();
+                    }, backoff);
                 };
-
-                socket.onclose = (event) => {
-                    if (heartbeatTimer) window.clearInterval(heartbeatTimer);
-                    heartbeatTimer = null;
-                    if (wsRef.current === socket) wsRef.current = null;
-                    if (cancelled || manualDisconnect.current) return;
-                    startPollingFallback();
-                    if (event.code === 1008) {
-                        setFeedback("[ws] policy rejected · verify exact FRONTEND_ORIGIN and matching TERMINAL_WS_SECRET in both Vercel projects");
-                    }
-                    scheduleReconnect();
-                };
-
-                if (heartbeatTimer) window.clearInterval(heartbeatTimer);
                 heartbeatTimer = window.setInterval(() => {
-                    if (socket?.readyState === WebSocket.OPEN && Date.now() - lastHeartbeat > 35000) {
-                        socket.close(4000, "heartbeat timeout");
-                    }
+                    if (socket?.readyState === WebSocket.OPEN && Date.now() - lastHeartbeat > 30000)
+                        socket.close();
                 }, 5000);
-            } catch (error) {
-                if (cancelled) return;
-                startPollingFallback();
-                if (!diagnosticShown) setFeedback(`[ws] ${error instanceof Error ? error.message : "connection setup failed"} · polling fallback active`);
-                scheduleReconnect();
+            }
+            catch {
+                if (!cancelled) {
+                    setStatus("reconnecting");
+                    retryTimer = window.setTimeout(() => {
+                        backoff = Math.min(backoff * 2, 15000);
+                        void connect();
+                    }, backoff);
+                }
             }
         };
-
         void connect();
         return () => {
             cancelled = true;
-            if (retryTimer) window.clearTimeout(retryTimer);
-            if (heartbeatTimer) window.clearInterval(heartbeatTimer);
-            if (fallbackTimer) window.clearInterval(fallbackTimer);
-            socket?.close(1000, "terminal unmounted");
+            if (retryTimer)
+                window.clearTimeout(retryTimer);
+            if (heartbeatTimer)
+                window.clearInterval(heartbeatTimer);
+            socket?.close();
             wsRef.current = null;
         };
     }, []);
@@ -601,8 +603,10 @@ export default function Terminal() {
               <button className="refresh-chart" onClick={() => void refreshChart()} title="Refresh chart">↻</button>
             </div>
           </div>
-          <div className="chart-viewport">
-            <MarketChart candles={candles} symbol={selected} interval={interval} loading={busy} livePrice={selectedQuote?.ltp} />
+          <div className="chart-viewport" ref={chartViewport}>
+            {chart.lines.length ? (<pre className="ascii-chart" aria-label={`${selected} historical price chart`}>
+                {chart.lines.map((line, row) => <span className="chart-line" key={row}>{line.map((char, column) => <span key={column} className={chart.directions[column] ? "chart-up" : "chart-down"}>{char}</span>)}</span>)}
+              </pre>) : <div className="chart-empty">{busy ? "FETCHING MARKET HISTORY…" : "NO CANDLE DATA · SELECT A SYMBOL OR CHECK API CONNECTION"}</div>}
           </div>
           <div className="chart-axis"><span>{candles[0]?.ts ? new Date(candles[0].ts).toLocaleDateString() : "—"}</span><span>{candles.length ? `${candles.length} BARS · ${interval.toUpperCase()}` : "WAITING FOR DATA"}</span><span>{candles[candles.length - 1]?.ts ? new Date(candles[candles.length - 1].ts).toLocaleDateString() : "—"}</span></div>
           <div className="indicator-row">
