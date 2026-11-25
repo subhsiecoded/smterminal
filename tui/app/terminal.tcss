@@ -1,0 +1,220 @@
+Screen {
+    background: #000000;
+    color: #00ff41;
+}
+
+#banner {
+    height: 2;
+    border-bottom: heavy #00ff41;
+    background: #000000;
+    color: #00ff41;
+    content-align: center middle;
+}
+
+#body {
+    height: 1fr;
+}
+
+#watchlist-panel {
+    width: 34;
+    border-right: heavy #00341a;
+}
+
+/* Below a certain terminal width there isn't room for both 34+38 columns
+   of side panels AND a usable chart — the chart is the one thing that
+   actually becomes useless at near-zero width, so the side panels give
+   way first, in two stages. Toggled from MarketTerminalApp.on_resize
+   (there's no Textual container-query equivalent) — see app.py. */
+#body.narrow #side-panel {
+    display: none;
+}
+#body.very-narrow #watchlist-panel {
+    display: none;
+}
+
+#watchlist-panel > #watchlist-title {
+    height: 1;
+    background: #00341a;
+    color: #00ff41;
+    text-style: bold;
+    padding: 0 1;
+}
+
+DataTable {
+    background: #000000;
+    color: #00ff41;
+}
+
+DataTable > .datatable--cursor {
+    background: #00ff41;
+    color: #000000;
+}
+
+DataTable > .datatable--header {
+    background: #00341a;
+    color: #00ff41;
+    text-style: bold;
+}
+
+#center-panel {
+    width: 1fr;
+}
+
+#chart-header {
+    height: 3;
+    padding: 0 1;
+    color: #00ff41;
+}
+
+#chart-body {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#indicators-row {
+    height: 1;
+    padding: 0 1;
+    color: #00b030;
+}
+
+#side-panel {
+    width: 38;
+    border-left: heavy #00341a;
+    padding: 0 1;
+}
+
+#side-panel-title {
+    height: 1;
+    background: #00341a;
+    color: #00ff41;
+    text-style: bold;
+}
+
+#ticker-tape {
+    height: 1;
+    background: #00341a;
+    color: #00ff80;
+}
+
+#command-row {
+    height: 3;
+    border-top: heavy #00ff41;
+}
+
+#command-prompt {
+    width: 2;
+    content-align: center middle;
+    color: #00ff41;
+}
+
+#command-input {
+    background: #000000;
+    color: #00ff41;
+    border: none;
+}
+
+#command-output {
+    height: 1;
+    color: #00b030;
+    padding: 0 1;
+}
+
+.up {
+    color: #00ff41;
+}
+
+.down {
+    color: #ff3b3b;
+}
+
+.dim {
+    color: #006622;
+}
+
+/* NSE screener: full-screen research workspace with a real cursor-driven table. */
+IndiaScreenerScreen {
+    align: center middle;
+    background: #000000 88%;
+}
+
+#screener-window {
+    width: 96%;
+    height: 92%;
+    border: heavy #00ff41;
+    background: #000000;
+    padding: 0 1;
+}
+
+#screener-title {
+    height: 2;
+    content-align: left middle;
+    background: #00341a;
+    color: #00ff41;
+    text-style: bold;
+    padding: 0 1;
+}
+
+#screener-meta {
+    height: 2;
+    padding: 0 1;
+    content-align: left middle;
+}
+
+#screener-filter {
+    height: 3;
+    margin: 0 0 1 0;
+    background: #000000;
+    color: #00ff41;
+    border: round #006622;
+}
+
+#screener-table {
+    height: 1fr;
+    border: heavy #00341a;
+    background: #000000;
+}
+
+#screener-status {
+    height: 1;
+    padding: 0 1;
+}
+
+#screener-help {
+    height: 2;
+    padding: 0 1;
+    color: #006622;
+    content-align: left middle;
+}
+
+IndiaStockDetailScreen {
+    align: center middle;
+    background: #000000 88%;
+}
+
+#stock-detail-window {
+    width: 90%;
+    height: 92%;
+    border: heavy #00ff41;
+    background: #000000;
+    padding: 1 2;
+}
+
+#stock-detail-title {
+    height: 2;
+    background: #00341a;
+    content-align: left middle;
+    padding: 0 1;
+    text-style: bold;
+}
+
+#stock-detail-body {
+    height: 1fr;
+    padding: 1;
+    overflow-y: auto;
+}
+
+#stock-detail-help {
+    height: 1;
+    color: #006622;
+    padding: 0 1;
+}
